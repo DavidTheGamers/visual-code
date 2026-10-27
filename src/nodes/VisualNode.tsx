@@ -1,0 +1,44 @@
+import { Handle, Position, NodeResizer, useReactFlow, type Node, type NodeProps } from "@xyflow/react";
+import type { FunctionNodeData } from "./nodeDefinitions";
+import "./nodes.css";
+
+export function VisualNode({ id, data, selected }: NodeProps<Node<FunctionNodeData>>) {
+  const flow = useReactFlow<Node<FunctionNodeData>>();
+  const minimumHeight = Math.max(72, (Math.max(data.inputs.length, data.outputs.length) + 1) * 18);
+
+  const renderPorts = (items: FunctionNodeData["inputs"], direction: "input" | "output") =>
+    items.map((port, index) => {
+      const label = port.label || `${direction === "input" ? "Input" : "Output"} ${index + 1}`;
+      const position = ((index + 1) / (items.length + 1)) * 100;
+      const isInput = direction === "input";
+      return (
+        <Handle
+          key={port.id}
+          id={`${isInput ? "in" : "out"}:${port.id}`}
+          type={isInput ? "target" : "source"}
+          position={isInput ? Position.Left : Position.Right}
+          title={label}
+          aria-label={label}
+          className={`vc-node-handle vc-node-handle-${direction} type-${port.type}`}
+          style={{ top: `${position}%` }}
+        />
+      );
+    });
+
+  return (
+    <div className={`vc-node${selected ? " vc-node-selected" : ""}`} style={{ background: data.color, width: data.width, minHeight: Math.max(minimumHeight, data.height ?? 0) }}>
+      <NodeResizer
+        isVisible={selected}
+        minWidth={190}
+        minHeight={minimumHeight}
+        onResizeEnd={(_event, size) => flow.updateNodeData(id, { width: size.width, height: size.height })}
+      />
+      {renderPorts(data.inputs, "input")}
+      {renderPorts(data.outputs, "output")}
+      <div className="vc-node-header">
+        <span className="vc-node-symbol">{data.kind === "value" ? "◇" : "ƒ"}</span>
+        <strong>{data.label}</strong>
+      </div>
+    </div>
+  );
+}
