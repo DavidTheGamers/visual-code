@@ -5,13 +5,13 @@ export type NodePort = { id: string; label: string; type: PortType };
 export type NodeKind = "function" | "value" | "composite";
 export type CompositeInputMapping = { inputId: string; nodeId: string; nodeInputId: string };
 export type CompositeOutputMapping = { outputId: string; nodeId: string; nodeOutputId: string };
-export type CompositeParameter = { id: string; name: string; sourceNodeId: string; targetNodeId: string; inputId: string; value: string; editable: boolean; sourceKind: "value" | "function" };
+export type CompositeParameter = { id: string; name: string; label?: string; sourceNodeId: string; targetNodeId: string; inputId: string; value: string; editable: boolean; sourceKind: "value" | "function" };
 export type EditableParameterKey = "name" | "description" | "inputCount" | "outputCount" | "logic" | "outputMappings";
 export type NodeParameterEditability = Record<EditableParameterKey, boolean> & {
   minInputCount?: number;
   minOutputCount?: number;
 };
-export type NodeValueParameter = { inputId: string; name: string; value: string; editable: boolean };
+export type NodeValueParameter = { inputId: string; name: string; label?: string; value: string; editable: boolean };
 export const DEFAULT_NODE_PARAMETER_EDITABILITY: NodeParameterEditability = {
   name: true,
   description: false,
@@ -30,6 +30,8 @@ export type FunctionNodeData = {
   compositeInputMappings?: CompositeInputMapping[];
   compositeOutputMappings?: CompositeOutputMapping[];
   compositeParameters?: CompositeParameter[];
+  /** Hide this node's generated statement while preserving output evaluation. */
+  show?: boolean;
 };
 export type NodeDefinition = {
   id: string; name: string; description: string; kind: NodeKind; inputs: NodePort[]; outputs: NodePort[];
@@ -40,13 +42,14 @@ export type NodeDefinition = {
   compositeInputMappings?: CompositeInputMapping[];
   compositeOutputMappings?: CompositeOutputMapping[];
   compositeParameters?: CompositeParameter[];
+  show?: boolean;
 };
 export const BUILT_IN_NODES: NodeDefinition[] = [
   { id: "builtin-value", name: "Value Node", description: "Supplies text to connected nodes.", kind: "value", inputs: [], outputs: [{id:"output1",label:"Value",type:"text"}], template: "", outputTemplates: ["value"] },
   { id: "builtin-function", name: "Function Node", description: "Generates text from an editable template.", kind: "function", inputs: [{id:"input1",label:"Input 1",type:"text"}], outputs: [{id:"output1",label:"Output 1",type:"text"}], template: "input1", outputTemplates: ["input1"] },
 ];
 export function createNodeData(definition: NodeDefinition): FunctionNodeData {
- return { label: definition.name, description: definition.description, kind: definition.kind,
+ return { label: definition.name, description: definition.description, kind: definition.kind, show: definition.show ?? true,
  inputs: definition.inputs.map(p=>({...p})), outputs: definition.outputs.map(p=>({...p})), template: definition.template,
  outputTemplates: [...definition.outputTemplates], editableParameters: { ...DEFAULT_NODE_PARAMETER_EDITABILITY, ...definition.editableParameters }, value: "", color: definition.color ?? (definition.kind === "value" ? "#303b52" : "#24344c"), definitionId: definition.id,
  category: definition.category ?? "Default", language: definition.language,
@@ -57,9 +60,27 @@ export function createNodeData(definition: NodeDefinition): FunctionNodeData {
  compositeParameters: definition.compositeParameters?.map((parameter) => ({ ...parameter })) ?? [], };
 }
 export function normalizeNodeData(data: Partial<FunctionNodeData>): FunctionNodeData {
- return { label:data.label ?? "Function", description:data.description ?? "", kind:data.kind ?? "function", inputs:data.inputs ?? [], outputs:data.outputs ?? [], template:data.template ?? "input1", outputTemplates:data.outputTemplates ?? [], editableParameters:data.editableParameters ? { ...DEFAULT_NODE_PARAMETER_EDITABILITY, ...data.editableParameters } : undefined, value:data.value ?? "", color:data.color ?? "#24344c", width:data.width, height:data.height, definitionId:data.definitionId, category:data.category ?? "Default", language:data.language, definitionGraph:data.definitionGraph, valueParameters:data.valueParameters?.map((parameter) => ({ ...parameter })) ?? [], compositeInputMappings:data.compositeInputMappings?.map((mapping) => ({ ...mapping })) ?? [], compositeOutputMappings:data.compositeOutputMappings?.map((mapping) => ({ ...mapping })) ?? [], compositeParameters:data.compositeParameters?.map((parameter) => ({ ...parameter })) ?? [] };
+ return { label:data.label ?? "Function", description:data.description ?? "", kind:data.kind ?? "function", show:data.show ?? true, inputs:data.inputs ?? [], outputs:data.outputs ?? [], template:data.template ?? "input1", outputTemplates:data.outputTemplates ?? [], editableParameters:data.editableParameters ? { ...DEFAULT_NODE_PARAMETER_EDITABILITY, ...data.editableParameters } : undefined, value:data.value ?? "", color:data.color ?? "#24344c", width:data.width, height:data.height, definitionId:data.definitionId, category:data.category ?? "Default", language:data.language, definitionGraph:data.definitionGraph, valueParameters:data.valueParameters?.map((parameter) => ({ ...parameter })) ?? [], compositeInputMappings:data.compositeInputMappings?.map((mapping) => ({ ...mapping })) ?? [], compositeOutputMappings:data.compositeOutputMappings?.map((mapping) => ({ ...mapping })) ?? [], compositeParameters:data.compositeParameters?.map((parameter) => ({ ...parameter })) ?? [] };
 }
 export function arePortTypesCompatible(source: PortType, target: PortType): boolean { return source === target; }
+export function isOrderEdge(edge: Edge): boolean { return edge.data?.connectionType === "order"; }
+export function getOrderEndpoints(connection: { source?: string | null; sourceHandle?: string | null; target?: string | null; targetHandle?: string | null }): { source: string; target: string } | null {
+ if (!connection.source || !connection.target) return null;
+ if (connection.sourceHandle === "order:out" && connection.targetHandle === "order:in") return { source: connection.source, target: connection.target };
+ if (connection.sourceHandle === "order:in" && connection.targetHandle === "order:out") return { source: connection.target, target: connection.source };
+ return null;
+}
+export function wouldCreateOrderCycle(edges: Edge[], source: string, target: string): boolean {
+ const adjacency = new Map<string, string[]>();
+ for (const edge of edges) {
+  if (isOrderEdge(edge) || edge.sourceHandle?.startsWith("out:") && edge.targetHandle?.startsWith("in:")) {
+   adjacency.set(edge.source, [...(adjacency.get(edge.source) ?? []), edge.target]);
+  }
+ }
+ const pending = [target]; const visited = new Set<string>();
+ while (pending.length) { const current = pending.pop()!; if (current === source) return true; if (visited.has(current)) continue; visited.add(current); pending.push(...(adjacency.get(current) ?? [])); }
+ return false;
+}
 /** Keep the first valid edge for each input/output endpoint. Used when
  * loading older graphs so saved data, rendered wires, and code generation agree. */
 export function retainValidSinglePortConnections(nodes: Node<FunctionNodeData>[], edges: Edge[]): Edge[] {
@@ -68,6 +89,11 @@ export function retainValidSinglePortConnections(nodes: Node<FunctionNodeData>[]
  const occupiedOutputs = new Set<string>();
  const valid: Edge[] = [];
  for (const edge of edges) {
+  if (isOrderEdge(edge)) {
+   if (!byId.has(edge.source) || !byId.has(edge.target) || edge.source === edge.target || wouldCreateOrderCycle(valid, edge.source, edge.target) || valid.some((item) => isOrderEdge(item) && item.source === edge.source && item.target === edge.target)) continue;
+   valid.push(edge);
+   continue;
+  }
   if (!edge.source || !edge.target || edge.source === edge.target || !edge.sourceHandle?.startsWith("out:") || !edge.targetHandle?.startsWith("in:")) continue;
   const source = byId.get(edge.source);
   const target = byId.get(edge.target);
@@ -75,7 +101,7 @@ export function retainValidSinglePortConnections(nodes: Node<FunctionNodeData>[]
   const input = target?.data.inputs?.find((port) => port.id === edge.targetHandle!.slice(3));
   const outputKey = `${edge.source}:${edge.sourceHandle}`;
   const inputKey = `${edge.target}:${edge.targetHandle}`;
-  if (!output || !input || !arePortTypesCompatible(output.type, input.type) || occupiedOutputs.has(outputKey) || occupiedInputs.has(inputKey)) continue;
+  if (!output || !input || !arePortTypesCompatible(output.type, input.type) || occupiedOutputs.has(outputKey) || occupiedInputs.has(inputKey) || wouldCreateOrderCycle(valid, edge.source, edge.target)) continue;
   occupiedOutputs.add(outputKey);
   occupiedInputs.add(inputKey);
   valid.push(edge);

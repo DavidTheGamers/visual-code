@@ -289,3 +289,7 @@
 .node-library-definition .node-library-item { flex:1; min-width:0; }
 .node-library-move { padding:5px; color:#8fa1ba; background:transparent; border:1px solid transparent; border-radius:4px; cursor:pointer; }
 .node-library-move:hover { color:#dceaff; border-color:#35445b; }
+.vc-order-handle { z-index:6; width:11px !important; height:11px !important; pointer-events:all !important; cursor:crosshair; background:#b56cff !important; border:2px solid #f1dfff !important; box-shadow:0 0 0 2px #542a83; }
+.vc-order-handle:hover { box-shadow:0 0 0 5px rgb(181 108 255 / 28%), 0 0 10px #b56cff; }
+.vc-order-target { top:0 !important; }
+.vc-order-source { bottom:0 !important; }

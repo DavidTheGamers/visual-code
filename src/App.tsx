@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import type { CSSProperties } from "react";
 import {
   ReactFlow,
+  ConnectionMode,
   SelectionMode,
   Background,
   Controls,
@@ -16,7 +18,7 @@ import {
   type OnEdgesChange,
   type ReactFlowInstance,
 } from "@xyflow/react";
-import { open } from "@tauri-apps/plugin-dialog";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { load } from "@tauri-apps/plugin-store";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -26,6 +28,9 @@ import {
   DEFAULT_NODE_PARAMETER_EDITABILITY,
   normalizeLanguageExtension,
   retainValidSinglePortConnections,
+  getOrderEndpoints,
+  isOrderEdge,
+  wouldCreateOrderCycle,
   type FunctionNodeData,
   type NodeDefinition,
   type NodePort,
@@ -48,7 +53,7 @@ type NodGraphFile = {
   edges: Edge[];
 };
 
-type CompositeCreationDraft = { definitionId: string; nodeIds: string[]; incomingEdges: Edge[]; outgoingEdges: Edge[]; center: { x: number; y: number } };
+type CompositeCreationDraft = { definitionId: string; nodeIds: string[]; incomingEdges: Edge[]; outgoingEdges: Edge[]; incomingOrderEdges: Edge[]; outgoingOrderEdges: Edge[]; center: { x: number; y: number } };
 
 type ProjectEntry = {
   path: string;
@@ -60,6 +65,25 @@ type ProjectEntry = {
 type EditorKind = "graph" | "text" | "none";
 
 const DEFAULT_EXTENSION = ".py";
+
+type ThemeMode = "dark" | "light";
+const DEFAULT_GRADIENT_START = "#102039";
+const DEFAULT_GRADIENT_END = "#245078";
+function normalizeHexColor(value: string | undefined, fallback: string): string {
+  return value && /^#[0-9a-f]{6}$/i.test(value) ? value : fallback;
+}
+function srgbLuminance(hex: string): number {
+  const channels = [1, 3, 5].map((index) => parseInt(hex.slice(index, index + 2), 16) / 255).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+  return channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722;
+}
+function gradientForeground(start: string, end: string): string {
+  const luminances = [srgbLuminance(start), srgbLuminance(end)];
+  const contrast = (foreground: number) => Math.min(...luminances.map((background) => {
+    const lighter = Math.max(foreground, background); const darker = Math.min(foreground, background);
+    return (lighter + 0.05) / (darker + 0.05);
+  }));
+  return contrast(0.0) >= contrast(1.0) ? "#111827" : "#ffffff";
+}
 
 function normalizeExtension(value: string): string {
   const cleaned = value.trim().replace(/^\.+/, "").toLowerCase();
@@ -128,6 +152,8 @@ function NodeLibrary({ libraryFolder, targetExtension, onAddNode, onEditDefiniti
   const [categoryName, setCategoryName] = useState("");
   const [categoryMenu, setCategoryMenu] = useState<string | null>(null);
   const [categoryDestination, setCategoryDestination] = useState("");
+  const [moveDefinitionId, setMoveDefinitionId] = useState<string | null>(null);
+  const [moveDefinitionDestination, setMoveDefinitionDestination] = useState("");
   const dragClickGuard = useRef<string | null>(null);
   const refresh = useCallback(async () => {
     const currentRequest = ++requestId.current;
@@ -182,14 +208,12 @@ function NodeLibrary({ libraryFolder, targetExtension, onAddNode, onEditDefiniti
     }
   }
 
-  async function moveDefinition(definition: NodeDefinition) {
+  async function moveDefinition(definition: NodeDefinition, destination: string) {
     const fromCategory = definition.category ?? "Default";
-    const available = categories.filter((name) => name !== fromCategory);
-    if (!available.length) { setMessage("Create another category first."); return; }
-    const destination = window.prompt(`Move ${definition.name} to category (${available.join(", ")}):`, available[0]);
-    if (!destination || !available.includes(destination)) return;
+    if (!destination || destination === fromCategory || !categories.includes(destination)) return;
     try {
       await invoke("move_node_definition", { libraryFolder, definitionId: definition.id, fromCategory, toCategory: destination });
+      setMoveDefinitionId(null);
       await refresh();
     } catch (error) { setMessage(String(error)); }
   }
@@ -244,8 +268,9 @@ function NodeLibrary({ libraryFolder, targetExtension, onAddNode, onEditDefiniti
         </button>
         {!builtIn && <>
           {(definition.kind === "function" || definition.kind === "composite") && <button className="node-library-move" title="Edit definition" aria-label={`Edit ${definition.name}`} onClick={() => onEditDefinition(definition)}>✎</button>}
-          <button className="node-library-move" title="Move to another category" aria-label={`Move ${definition.name}`} onClick={() => void moveDefinition(definition)}>↗</button>
+          <button className="node-library-move" title="Move to another category" aria-label={`Move ${definition.name}`} onClick={() => { setMoveDefinitionId((current) => current === definition.id ? null : definition.id); setMoveDefinitionDestination(definition.category ?? "Default"); }}>↗</button>
         </>}
+        {moveDefinitionId === definition.id && <div className="node-definition-move"><select value={moveDefinitionDestination} onChange={(event) => setMoveDefinitionDestination(event.target.value)}>{categories.filter((item) => item !== (definition.category ?? "Default")).map((item) => <option key={item} value={item}>{item.split("/").join(" › ")}</option>)}</select><button disabled={!moveDefinitionDestination || moveDefinitionDestination === (definition.category ?? "Default")} onClick={() => void moveDefinition(definition, moveDefinitionDestination)}>Move</button></div>}
       </div>
     );
   }
@@ -334,6 +359,10 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsNotice, setSettingsNotice] = useState("");
   const [settingsSaving, setSettingsSaving] = useState(false);
+  const [themeMode, setThemeMode] = useState<ThemeMode>("dark");
+  const [gradientStart, setGradientStart] = useState(DEFAULT_GRADIENT_START);
+  const [gradientEnd, setGradientEnd] = useState(DEFAULT_GRADIENT_END);
+  const [gradientAngle, setGradientAngle] = useState(135);
 
   const [entries, setEntries] = useState<ProjectEntry[]>([]);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(
@@ -422,8 +451,16 @@ export default function App() {
         const savedExtension =
           await store.get<string>("preferredExtension");
         const savedSidebarWidth = await store.get<number>("sidebarWidth");
+        const savedTheme = await store.get<string>("themeMode");
+        const savedGradientStart = await store.get<string>("gradientStart");
+        const savedGradientEnd = await store.get<string>("gradientEnd");
+        const savedGradientAngle = await store.get<number>("gradientAngle");
 
         if (typeof savedSidebarWidth === "number" && Number.isFinite(savedSidebarWidth)) setSidebarWidth(savedSidebarWidth);
+        setThemeMode(savedTheme === "light" ? "light" : "dark");
+        setGradientStart(normalizeHexColor(savedGradientStart, DEFAULT_GRADIENT_START));
+        setGradientEnd(normalizeHexColor(savedGradientEnd, DEFAULT_GRADIENT_END));
+        if (typeof savedGradientAngle === "number" && Number.isFinite(savedGradientAngle)) setGradientAngle(Math.max(0, Math.min(360, savedGradientAngle)));
         setProjectFolder(savedProject ?? "");
         setNodeLibraryFolder(savedLibrary ?? "");
 
@@ -539,9 +576,9 @@ export default function App() {
 
       if (
         isDirty &&
-        !window.confirm(
+        !(await confirm(
           "Switch projects? Unsaved changes may be lost.",
-        )
+        ))
       ) {
         return;
       }
@@ -597,6 +634,10 @@ export default function App() {
 
       await store.set("nodeLibraryFolder", nodeLibraryFolder);
       await store.set("preferredExtension", extension);
+      await store.set("themeMode", themeMode);
+      await store.set("gradientStart", gradientStart);
+      await store.set("gradientEnd", gradientEnd);
+      await store.set("gradientAngle", gradientAngle);
       await store.save();
 
       setPreferredExtension(extension);
@@ -631,6 +672,12 @@ export default function App() {
       if (!connection.source || !connection.target || connection.source === connection.target) {
         return false;
       }
+      const orderEndpoints = getOrderEndpoints(connection);
+      if (connection.sourceHandle?.startsWith("order:") || connection.targetHandle?.startsWith("order:")) {
+        if (!orderEndpoints || orderEndpoints.source === orderEndpoints.target) return false;
+        if (edges.some((edge) => isOrderEdge(edge) && edge.source === orderEndpoints.source && edge.target === orderEndpoints.target)) return false;
+        return !wouldCreateOrderCycle(edges, orderEndpoints.source, orderEndpoints.target);
+      }
 
       const sourceNode = nodes.find((node) => node.id === connection.source);
       const targetNode = nodes.find((node) => node.id === connection.target);
@@ -645,6 +692,7 @@ export default function App() {
         (edge.target === connection.target && edge.targetHandle === connection.targetHandle)
       ));
       if (occupied) return false;
+      if (wouldCreateOrderCycle(edges, connection.source, connection.target)) return false;
 
       return Boolean(
         sourcePort &&
@@ -658,25 +706,30 @@ export default function App() {
   const onConnect = useCallback(
     (connection: Connection) => {
       if (!isValidConnection(connection)) return;
+      const orderEndpoints = getOrderEndpoints(connection);
+      const ordering = Boolean(orderEndpoints);
+      const normalizedConnection = ordering ? { ...connection, source: orderEndpoints!.source, target: orderEndpoints!.target, sourceHandle: "order:out", targetHandle: "order:in" } : connection;
 
-      const sourceNode = nodes.find((node) => node.id === connection.source);
-      const sourcePort = getPort(sourceNode, connection.sourceHandle, "output");
+      const sourceNode = nodes.find((node) => node.id === normalizedConnection.source);
+      const sourcePort = getPort(sourceNode, normalizedConnection.sourceHandle, "output");
       const isExecutionConnection = sourcePort?.type === "exec";
-      const edgeColor = isExecutionConnection ? "#f4f4f5" : "#60a5fa";
+      const edgeColor = ordering ? "#b56cff" : isExecutionConnection ? "#f4f4f5" : "#60a5fa";
 
       setEdges((current) => {
         // Recheck against the latest state so rapid or concurrent connection
         // gestures cannot claim the same input or output.
-        if (current.some((edge) =>
-          (edge.source === connection.source && edge.sourceHandle === connection.sourceHandle) ||
-          (edge.target === connection.target && edge.targetHandle === connection.targetHandle)
-        )) return current;
+        if (ordering && (current.some((edge) => isOrderEdge(edge) && edge.source === normalizedConnection.source && edge.target === normalizedConnection.target) || wouldCreateOrderCycle(current, normalizedConnection.source!, normalizedConnection.target!))) return current;
+        if (!ordering && (current.some((edge) =>
+          (edge.source === normalizedConnection.source && edge.sourceHandle === normalizedConnection.sourceHandle) ||
+          (edge.target === normalizedConnection.target && edge.targetHandle === normalizedConnection.targetHandle)
+        ) || wouldCreateOrderCycle(current, connection.source!, connection.target!))) return current;
         return addEdge(
           {
-            ...connection,
+            ...normalizedConnection,
             id: crypto.randomUUID(),
             type: "smoothstep",
-            animated: isExecutionConnection,
+            animated: isExecutionConnection || ordering,
+            data: ordering ? { connectionType: "order" } : undefined,
             markerEnd: {
               type: MarkerType.ArrowClosed,
               color: edgeColor,
@@ -719,8 +772,10 @@ export default function App() {
     if (!nodeLibraryFolder.trim()) { setNotice("Choose a Node Library folder before creating a reusable Composite Node."); return; }
     const selectedIds = new Set(selected.map((node) => node.id));
     const internalEdges = edges.filter((edge) => selectedIds.has(edge.source) && selectedIds.has(edge.target));
-    const incomingEdges = edges.filter((edge) => !selectedIds.has(edge.source) && selectedIds.has(edge.target));
-    const outgoingEdges = edges.filter((edge) => selectedIds.has(edge.source) && !selectedIds.has(edge.target));
+    const incomingEdges = edges.filter((edge) => !isOrderEdge(edge) && !selectedIds.has(edge.source) && selectedIds.has(edge.target));
+    const outgoingEdges = edges.filter((edge) => !isOrderEdge(edge) && selectedIds.has(edge.source) && !selectedIds.has(edge.target));
+    const incomingOrderEdges = edges.filter((edge) => isOrderEdge(edge) && !selectedIds.has(edge.source) && selectedIds.has(edge.target));
+    const outgoingOrderEdges = edges.filter((edge) => isOrderEdge(edge) && selectedIds.has(edge.source) && !selectedIds.has(edge.target));
     const inputs = incomingEdges.map((_edge, index) => ({ id: `input${index + 1}`, label: `Input ${index + 1}`, type: "text" as const }));
     const outputs = outgoingEdges.map((_edge, index) => ({ id: `output${index + 1}`, label: `Output ${index + 1}`, type: "text" as const }));
     const compositeInputMappings = incomingEdges.map((edge, index) => ({ inputId: inputs[index].id, nodeId: edge.target, nodeInputId: (edge.targetHandle ?? "").replace(/^in:/, "") }));
@@ -732,7 +787,7 @@ export default function App() {
       definitionGraph: { nodes: selected.map((node) => ({ ...node, selected: false })), edges: internalEdges },
       compositeInputMappings, compositeOutputMappings,
     };
-    setCompositeCreationDraft({ definitionId: definition.id, nodeIds: [...selectedIds], incomingEdges, outgoingEdges, center });
+    setCompositeCreationDraft({ definitionId: definition.id, nodeIds: [...selectedIds], incomingEdges, outgoingEdges, incomingOrderEdges, outgoingOrderEdges, center });
     setDefinitionTargetNodeId("");
     setDefinitionDraft(definition);
     setSettingsNodeId("");
@@ -838,9 +893,9 @@ export default function App() {
 
     if (
       isDirty &&
-      !window.confirm(
+      !(await confirm(
         "Open this file and discard unsaved changes?",
-      )
+      ))
     ) {
       return;
     }
@@ -918,7 +973,7 @@ export default function App() {
     }
   }
 
-  function startNewGraph() {
+  async function startNewGraph() {
     if (!projectFolder) {
       setNotice(
         "Choose a project folder before creating a graph.",
@@ -928,9 +983,9 @@ export default function App() {
 
     if (
       isDirty &&
-      !window.confirm(
+      !(await confirm(
         "Discard unsaved changes and create a new graph?",
-      )
+      ))
     ) {
       return;
     }
@@ -1063,7 +1118,7 @@ export default function App() {
       ? `Delete ${entry.path}?\n\nIts associated source file (${linkedSource}) will NOT be deleted.`
       : `Delete ${entry.path}?\n\nThis permanently deletes the graph file only.`;
 
-    if (!window.confirm(message)) return;
+    if (!(await confirm(message))) return;
 
     try {
       await invoke("delete_project_graph", {
@@ -1111,9 +1166,9 @@ export default function App() {
       ? `Delete folder ${entry.path} and everything inside it? This cannot be undone.`
       : `Delete ${entry.path}? This cannot be undone.`;
 
-    if (!window.confirm(message)) return;
+    if (!(await confirm(message))) return;
     if (removesActiveFile && isDirty &&
-      !window.confirm("The selected item contains unsaved changes. Delete it and discard those changes?")) {
+      !(await confirm("The selected item contains unsaved changes. Delete it and discard those changes?"))) {
       return;
     }
 
@@ -1334,6 +1389,7 @@ export default function App() {
       name: data.label,
       description: data.description,
       kind: "function",
+      show: data.show ?? true,
       inputs: data.inputs.map((port) => ({ ...port })),
       outputs: data.outputs.map((port) => ({ ...port })),
       template: data.template,
@@ -1362,8 +1418,10 @@ export default function App() {
         const output = definition.outputs[index];
         return output ? [{ ...edge, source: outerId, sourceHandle: `out:${output.id}` }] : [];
       });
+      const incomingOrder = compositeCreation.incomingOrderEdges.map((edge) => ({ ...edge, target: outerId, targetHandle: "order:in" }));
+      const outgoingOrder = compositeCreation.outgoingOrderEdges.map((edge) => ({ ...edge, source: outerId, sourceHandle: "order:out" }));
       const nextNodes = [...nodes.filter((node) => !selectedIds.has(node.id)), outer];
-      const nextEdges = [...edges.filter((edge) => !selectedIds.has(edge.source) && !selectedIds.has(edge.target)), ...incoming, ...outgoing];
+      const nextEdges = [...edges.filter((edge) => !selectedIds.has(edge.source) && !selectedIds.has(edge.target)), ...incoming, ...outgoing, ...incomingOrder, ...outgoingOrder];
       setNodes(nextNodes);
       setEdges(retainValidSinglePortConnections(nextNodes, nextEdges));
       setCompositeCreationDraft(null);
@@ -1442,9 +1500,16 @@ export default function App() {
     [entries, expandedFolders, explorerOrder],
   );
 
+  const appearanceStyle = {
+    "--app-gradient": `linear-gradient(${gradientAngle}deg, ${gradientStart}, ${gradientEnd})`,
+    "--gradient-ink": gradientForeground(gradientStart, gradientEnd),
+  } as CSSProperties;
+
   return (
     <main
       className="container"
+      data-theme={themeMode}
+      style={appearanceStyle}
       onClick={() => setActiveContextMenu("")}
     >
       <header className="topbar">
@@ -1707,6 +1772,7 @@ export default function App() {
               <div className="definition-editor-host">
                 {definitionDraft.kind === "composite" ? <CompositeDefinitionEditor
                   initialDefinition={definitionDraft}
+                  themeMode={themeMode}
                   targetExtension={normalizeExtension(targetExtension)}
                   libraryFolder={nodeLibraryPath(nodeLibraryFolder, targetExtension)}
                   isNew={compositeCreationDraft?.definitionId === definitionDraft.id}
@@ -1717,6 +1783,7 @@ export default function App() {
                   onAddNodeHandler={registerDefinitionAddNodeHandler}
                 /> : <FunctionDefinitionEditor
                   initialDefinition={definitionDraft}
+                  themeMode={themeMode}
                   targetExtension={normalizeExtension(targetExtension)}
                   libraryFolder={nodeLibraryPath(nodeLibraryFolder, targetExtension)}
                   onCancel={() => { setDefinitionDraft(null); setDefinitionTargetNodeId(""); setCompositeCreationDraft(null); }}
@@ -1751,8 +1818,9 @@ export default function App() {
 
               <div className="graph-area">
                 <ReactFlow
+                  connectionMode={ConnectionMode.Loose}
                   nodes={nodes}
-                  edges={edges}
+                  edges={edges.map((edge) => isOrderEdge(edge) ? { ...edge, animated: true, style: { stroke: "#b56cff", strokeWidth: 2, ...edge.style }, markerEnd: { type: MarkerType.ArrowClosed, color: "#b56cff" } } : edge)}
                   nodeTypes={nodeTypes}
                   onNodesChange={handleNodesChange}
                   onEdgesChange={handleEdgesChange}
@@ -1768,7 +1836,7 @@ export default function App() {
                   selectionMode={SelectionMode.Partial}
                   multiSelectionKeyCode="Shift"
                   fitView
-                  colorMode="dark"
+                  colorMode={themeMode}
                   deleteKeyCode={["Backspace", "Delete"]}
                   defaultEdgeOptions={{
                     markerEnd: {
@@ -1777,7 +1845,7 @@ export default function App() {
                   }}
                 >
                   <Background
-                    color="#303c50"
+                    color={themeMode === "light" ? "#b8c4d4" : "#303c50"}
                     gap={22}
                     size={1}
                   />
@@ -1785,8 +1853,8 @@ export default function App() {
                   <Controls />
 
                   <MiniMap
-                    nodeColor="#162238"
-                    maskColor="rgba(9, 11, 16, 0.75)"
+                    nodeColor={themeMode === "light" ? "#64748b" : "#162238"}
+                    maskColor={themeMode === "light" ? "rgba(226, 232, 240, 0.72)" : "rgba(9, 11, 16, 0.75)"}
                   />
                 </ReactFlow>
                 {settingsNodeId && (() => {
@@ -1800,7 +1868,7 @@ export default function App() {
                   const minimumInputs = lockedDefinition ? Math.max(0, editability.minInputCount ?? data.inputs.length) : 0;
                   const minimumOutputs = lockedDefinition ? Math.max(0, editability.minOutputCount ?? data.outputs.length) : 0;
                   const update = (patch: Partial<FunctionNodeData>) => {
-                    const independent = new Set(["label", "value", "inputs", "outputs", "template", "outputTemplates", "valueParameters", "compositeParameters"]);
+                    const independent = new Set(["label", "value", "inputs", "outputs", "template", "outputTemplates", "valueParameters", "compositeParameters", "show"]);
                     const patchKeys = Object.keys(patch);
                     const shareAcrossSelection = patchKeys.every((key) => !independent.has(key));
                     const selectedIds = shareAcrossSelection
@@ -1849,7 +1917,7 @@ export default function App() {
                     {data.kind === "value" && <label>Value<input value={nodeValueOverrides[selectedId] ?? data.value ?? ""} onChange={(event) => updateNodeValue(selectedId, event.target.value)} /></label>}
                     {data.kind === "function" && (data.valueParameters ?? []).filter((parameter) =>
                       parameter.editable && !edges.some((edge) => edge.target === selectedId && edge.targetHandle === `in:${parameter.inputId}`),
-                    ).map((parameter) => <label key={parameter.inputId}>{parameter.name}
+                    ).map((parameter) => <label key={parameter.inputId}>{parameter.label?.trim() || parameter.name}
                       <input value={parameter.value} onChange={(event) => {
                         const value = event.target.value;
                         setNodes((current) => current.map((node) => node.id === selectedId
@@ -1861,7 +1929,7 @@ export default function App() {
                     {data.kind === "composite" && (data.compositeParameters ?? []).filter((parameter) => parameter.editable && !edges.some((edge) => {
                       const outerInput = edge.target === selectedId ? edge.targetHandle?.replace(/^in:/, "") : "";
                       return data.compositeInputMappings?.some((mapping) => mapping.inputId === outerInput && mapping.nodeId === parameter.targetNodeId && mapping.nodeInputId === parameter.inputId) ?? false;
-                    })).map((parameter) => <label key={parameter.id}>{parameter.name}<input value={parameter.value} onChange={(event) => {
+                    })).map((parameter) => <label key={parameter.id}>{parameter.label?.trim() || parameter.name}<input value={parameter.value} onChange={(event) => {
                       const value = event.target.value;
                       setNodes((current) => current.map((node) => node.id === selectedId
                         ? { ...node, data: { ...node.data, compositeParameters: (node.data.compositeParameters ?? []).map((item) => item.id === parameter.id ? { ...item, value } : item) } }
@@ -1869,6 +1937,7 @@ export default function App() {
                       setIsDirty(true);
                     }} /></label>)}
                     <label>Color<input type="color" value={data.color ?? "#24344c"} onChange={(event) => update({ color: event.target.value })} /></label>
+                    {data.kind !== "value" && <label className="show-generated-setting"><span>Show generated text</span><input type="checkbox" checked={data.show !== false} onChange={(event) => update({ show: event.target.checked })} /></label>}
                     {canEditInputs && <label>Inputs<input type="number" min={minimumInputs} max="16" value={data.inputs.length} onChange={(event) => resizePorts("inputs", Number(event.target.value))} /></label>}
                     {canEditOutputs && <label>Outputs<input type="number" min={minimumOutputs} max="16" value={data.outputs.length} onChange={(event) => resizePorts("outputs", Number(event.target.value))} /></label>}
                     {lockedDefinition && editability.logic && <label>Logic<textarea value={data.template} onChange={(event) => update({ template: event.target.value })} /></label>}
@@ -2213,6 +2282,21 @@ export default function App() {
                       placeholder="js"
                     />
                   </div>
+                </div>
+
+                <div className="folder-setting appearance-setting">
+                  <label>Appearance</label>
+                  <p>Choose a light or dark workspace and a gradient background. Text color adjusts automatically for contrast.</p>
+                  <div className="theme-mode-options" role="group" aria-label="Color mode">
+                    <button type="button" className={themeMode === "dark" ? "selected" : ""} aria-pressed={themeMode === "dark"} onClick={() => setThemeMode("dark")}>Dark mode</button>
+                    <button type="button" className={themeMode === "light" ? "selected" : ""} aria-pressed={themeMode === "light"} onClick={() => setThemeMode("light")}>Light mode</button>
+                  </div>
+                  <div className="gradient-color-fields">
+                    <label htmlFor="gradient-start">Gradient start<input id="gradient-start" type="color" value={gradientStart} onChange={(event) => setGradientStart(event.target.value)} /></label>
+                    <label htmlFor="gradient-end">Gradient end<input id="gradient-end" type="color" value={gradientEnd} onChange={(event) => setGradientEnd(event.target.value)} /></label>
+                  </div>
+                  <label className="gradient-angle-control" htmlFor="gradient-angle">Gradient angle <span>{gradientAngle}°</span><input id="gradient-angle" type="range" min="0" max="360" value={gradientAngle} onChange={(event) => setGradientAngle(Number(event.target.value))} /></label>
+                  <div className="gradient-preview" style={{ background: `linear-gradient(${gradientAngle}deg, ${gradientStart}, ${gradientEnd})`, color: gradientForeground(gradientStart, gradientEnd) }}><strong>Text contrast preview</strong><span>Visual Code adjusts foreground color to stay readable.</span></div>
                 </div>
 
                 {settingsNotice && (

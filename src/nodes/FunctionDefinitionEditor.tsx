@@ -32,6 +32,7 @@ const nodeTypes = { function: VisualNode };
 
 type Props = {
   initialDefinition: NodeDefinition;
+  themeMode: "dark" | "light";
   targetExtension: string;
   libraryFolder: string;
   onCancel: () => void;
@@ -68,7 +69,7 @@ function validDefinitionEdges(definition: NodeDefinition): Edge[] {
   });
 }
 
-export default function FunctionDefinitionEditor({ initialDefinition, targetExtension, libraryFolder, onCancel, onSaved, onAddNodeHandler }: Props) {
+export default function FunctionDefinitionEditor({ initialDefinition, targetExtension, libraryFolder, themeMode, onCancel, onSaved, onAddNodeHandler }: Props) {
   const [name, setName] = useState(initialDefinition.name);
   const [description, setDescription] = useState(initialDefinition.description);
   const [template, setTemplate] = useState(initialDefinition.template);
@@ -83,11 +84,15 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
   const [parameterEditable, setParameterEditable] = useState<Record<string, boolean>>(() => Object.fromEntries(
     (initialDefinition.valueParameters ?? []).map((parameter) => [parameter.inputId, parameter.editable]),
   ));
+  const [parameterLabels, setParameterLabels] = useState<Record<string, string>>(() => Object.fromEntries(
+    (initialDefinition.valueParameters ?? []).map((parameter) => [parameter.inputId, parameter.label ?? ""]),
+  ));
   const [editableParameters, setEditableParameters] = useState<NodeParameterEditability>(() => ({
     ...DEFAULT_NODE_PARAMETER_EDITABILITY,
     ...initialDefinition.editableParameters,
   }));
   const [category, setCategory] = useState(initialDefinition.category ?? "Default");
+  const [show, setShow] = useState(initialDefinition.show ?? true);
   const [categories, setCategories] = useState<string[]>(["Default"]);
   const [valueNodes, setValueNodes] = useState<Node<FunctionNodeData>[]>(() =>
     (initialDefinition.definitionGraph?.nodes ?? [])
@@ -161,10 +166,11 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
     return [{
       inputId: input.id,
       name: `value${index + 1}`,
+      label: parameterLabels[input.id] ?? initialDefinition.valueParameters?.find((parameter) => parameter.inputId === input.id)?.label ?? "",
       value: nodeValues[source.id] ?? source.data.value ?? "",
       editable: parameterEditable[input.id] ?? existing?.editable ?? true,
     }];
-  }), [edges, initialDefinition.valueParameters, inputs, nodeValues, parameterEditable, valueNodes]);
+  }), [edges, initialDefinition.valueParameters, inputs, nodeValues, parameterEditable, parameterLabels, valueNodes]);
 
   const handleNodesChange = useCallback((changes: NodeChange<Node<FunctionNodeData>>[]) => {
     setValueNodes((current) => applyNodeChanges(changes.filter((change) => change.type === "add" || change.id !== ROOT_ID), current));
@@ -265,6 +271,7 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
       outputs,
       template,
       outputTemplates: mappings,
+      show,
       valueParameters,
       editableParameters: {
         ...editableParameters,
@@ -321,10 +328,10 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
           onNodeDoubleClick={(_event, node) => { if (node.id !== ROOT_ID) setSettingsNodeId(node.id); }}
           onNodeContextMenu={(event, node) => { event.preventDefault(); if (node.id !== ROOT_ID) setSettingsNodeId(node.id); }}
           fitView
-          colorMode="dark"
+          colorMode={themeMode}
           defaultEdgeOptions={{ type: "smoothstep" }}
         >
-          <Background color="#303c50" gap={22} size={1} />
+          <Background color={themeMode === "light" ? "#b8c4d4" : "#303c50"} gap={22} size={1} />
           <Controls />
           <MiniMap nodeColor="#162238" maskColor="rgba(9, 11, 16, 0.75)" />
         </ReactFlow>
@@ -379,12 +386,14 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
         </div>
         <div className="definition-save-controls">
           <label>Category<select value={category} onChange={(event) => setCategory(event.target.value)}>{categories.map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
+          <label className="definition-show-default"><input type="checkbox" checked={show} onChange={(event) => setShow(event.target.checked)} /> Show by default</label>
           <button className="save-button" disabled={saving || !libraryFolder.trim()} onClick={() => void saveDefinition()}>{saving ? "Saving…" : "Save definition"}</button>
         </div>
       {valueParameters.length > 0 && <div className="definition-value-parameters">
         <strong>Value parameters</strong>
         {valueParameters.map((parameter) => <label key={parameter.inputId}>
           <span>{parameter.name} · {parameter.inputId}</span>
+          {parameter.editable && <input aria-label={`${parameter.name} display label`} placeholder={parameter.name} value={parameter.label ?? ""} onChange={(event) => setParameterLabels((current) => ({ ...current, [parameter.inputId]: event.target.value }))} />}
           <input value={parameter.value} readOnly aria-label={`${parameter.name} default value`} />
           <span><input type="checkbox" checked={parameter.editable} onChange={(event) => setParameterEditable((current) => ({ ...current, [parameter.inputId]: event.target.checked }))} /> Editable on instances</span>
         </label>)}

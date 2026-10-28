@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { retainValidSinglePortConnections } from "./nodeDefinitions.ts";
+import { getOrderEndpoints, retainValidSinglePortConnections, wouldCreateOrderCycle } from "./nodeDefinitions.ts";
 import { generateSource } from "./codeGeneration.ts";
 
 const value = (id, contents) => ({ id, type: "function", position: { x: 0, y: 0 }, data: { label: id, kind: "value", inputs: [], outputs: [{ id: "output1", type: "text" }], template: "", outputTemplates: ["value"], value: contents } });
@@ -41,4 +41,62 @@ test("Composite parameters configure internal Value Nodes and external inputs ta
   assert.equal(generateSource([composite], []), "print(configured)\n");
   const external = value("external", "external_value");
   assert.equal(generateSource([external, composite], [edge("override", "external", "output1", "composite", "input1")]), "print(external_value)\n");
+});
+
+const order = (id, source, target) => ({ id, source, sourceHandle: "order:out", target, targetHandle: "order:in", data: { connectionType: "order" } });
+
+test("purple connections normalize either drag direction and reject normal ports", () => {
+  assert.deepEqual(getOrderEndpoints({ source: "a", sourceHandle: "order:out", target: "b", targetHandle: "order:in" }), { source: "a", target: "b" });
+  assert.deepEqual(getOrderEndpoints({ source: "b", sourceHandle: "order:in", target: "a", targetHandle: "order:out" }), { source: "a", target: "b" });
+  assert.equal(getOrderEndpoints({ source: "a", sourceHandle: "out:output1", target: "b", targetHandle: "order:in" }), null);
+});
+
+test("normal dependencies produce deterministic order without purple connections", () => {
+  const first = fn("first", "a = 1", [], [], []);
+  const second = fn("second", "print(a)", ["input1"], [], []);
+  assert.equal(generateSource([second, first], [edge("dependency", "first", "output1", "second", "input1")]), "a = 1\nprint(a)\n");
+});
+
+test("purple connections put an independent statement after and before a network", () => {
+  const network = fn("network", "print('result')", [], [], []);
+  const done = fn("done", "print('Done')", [], [], []);
+  assert.equal(generateSource([done, network], [order("after", "network", "done")]), "print('result')\nprint('Done')\n");
+  assert.equal(generateSource([network, done], [order("before", "done", "network")]), "print('Done')\nprint('result')\n");
+});
+
+test("purple ordering combines multiple independent networks and persists through graph JSON", () => {
+  const nodes = [fn("c", "print('C')", [], [], []), fn("a", "print('A')", [], [], []), fn("b", "print('B')", [], [], [])];
+  const edges = [order("ab", "a", "b"), order("bc", "b", "c")];
+  const reopened = JSON.parse(JSON.stringify({ nodes, edges }));
+  assert.equal(generateSource(reopened.nodes, reopened.edges), "print('A')\nprint('B')\nprint('C')\n");
+});
+
+test("contradictory purple and data dependencies are rejected and diagnosed", () => {
+  const nodes = [fn("a", "a = 1", [], ["output1"], ["Logic"]), fn("b", "print(input1)", ["input1"], [], [])];
+  const dependency = edge("data", "a", "output1", "b", "input1");
+  assert.equal(wouldCreateOrderCycle([dependency], "b", "a"), true);
+  assert.throws(() => generateSource(nodes, [dependency, order("conflict", "b", "a")]), /contradictory or circular/);
+});
+
+test("Composite expansion preserves internal purple order edges", () => {
+  const earlier = fn("earlier", "print('first')", [], [], []);
+  const later = fn("later", "print('second')", [], [], []);
+  const composite = { id: "composite-order", type: "function", position: { x: 0, y: 0 }, data: { label: "Ordered", kind: "composite", inputs: [], outputs: [], template: "", outputTemplates: [], definitionGraph: { nodes: [later, earlier], edges: [order("inside-order", "earlier", "later")] } } };
+  assert.equal(generateSource([composite], []), "print('first')\nprint('second')\n");
+});
+
+test("hidden nodes still feed outputs without emitting their own line; labels persist", () => {
+  const add = fn("add", "input1 + input2", ["input1", "input2"], ["output1"], ["Logic"], { show: false });
+  const print = fn("print", "print(input1)", ["input1"], [], []);
+  const three = value("three", "1"); const five = value("five", "2");
+  const nodes = [three, five, add, print];
+  const edges = [edge("left", "three", "output1", "add", "input1"), edge("right", "five", "output1", "add", "input2"), edge("result", "add", "output1", "print", "input1")];
+  assert.equal(generateSource(nodes, edges), "print((1 + 2))\n");
+  const definition = { valueParameters: [{ inputId: "input1", name: "value1", label: "Starting Value", value: "1", editable: true }] };
+  assert.equal(JSON.parse(JSON.stringify(definition)).valueParameters[0].label, "Starting Value");
+});
+
+test("hidden side-effecting Logic is reported instead of silently removed", () => {
+  const sideEffect = fn("side-effect", "print('hello')", [], [], [], { show: false });
+  assert.throws(() => generateSource([sideEffect], []), /hidden but its Logic may have side effects/);
 });

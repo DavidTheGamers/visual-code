@@ -19,7 +19,7 @@ export function generateSource(nodes: Node<FunctionNodeData>[], edges: Edge[]): 
         if (parameter.sourceKind === "value" && data.kind === "value") data = { ...data, value: parameter.value };
         else if (parameter.sourceKind === "function") data = { ...data, valueParameters: (data.valueParameters ?? []).map((item) => item.inputId === parameter.inputId ? { ...item, value: parameter.value } : item) };
       }
-      return { ...node, id: prefix + node.id, selected: false, data };
+      return { ...node, id: prefix + node.id, selected: false, data: { ...data, show: composite.data.show === false ? false : data.show ?? true } };
     });
     const externalInputs = new Set(boundaryEdges
       .filter((edge) => edge.target === composite.id)
@@ -32,6 +32,16 @@ export function generateSource(nodes: Node<FunctionNodeData>[], edges: Edge[]): 
     const nodeIds = new Set((graph?.nodes ?? []).map((node) => node.id));
     const mappedEdges: Edge[] = [];
     for (const edge of boundaryEdges) {
+      if (edge.data?.connectionType === "order") {
+        const innerIds = new Set(internalNodes.filter((node) => node.data.kind === "function").map((node) => node.id));
+        const internalOutgoing = new Set(internalEdges.filter((item) => innerIds.has(item.source) && innerIds.has(item.target) && (item.data?.connectionType === "order" || item.sourceHandle?.startsWith("out:") && item.targetHandle?.startsWith("in:"))).map((item) => item.source));
+        const internalIncoming = new Set(internalEdges.filter((item) => innerIds.has(item.source) && innerIds.has(item.target) && (item.data?.connectionType === "order" || item.sourceHandle?.startsWith("out:") && item.targetHandle?.startsWith("in:"))).map((item) => item.target));
+        const endpoints = edge.target === composite.id
+          ? [...innerIds].filter((id) => !internalIncoming.has(id))
+          : [...innerIds].filter((id) => !internalOutgoing.has(id));
+        for (const endpoint of endpoints) mappedEdges.push({ ...edge, id: `${edge.id}::order:${endpoint}`, ...(edge.target === composite.id ? { target: endpoint, targetHandle: "order:in" } : { source: endpoint, sourceHandle: "order:out" }) });
+        continue;
+      }
       if (edge.target === composite.id) {
         const inputId = edge.targetHandle?.replace(/^in:/, "") ?? "";
         const mapping = composite.data.compositeInputMappings?.find((item) => item.inputId === inputId);
@@ -116,22 +126,18 @@ export function generateSource(nodes: Node<FunctionNodeData>[], edges: Edge[]): 
   const functionNodeIds = new Set(functionNodes.map((node) => node.id));
   const pending = [...functionNodes];
   const orderedNodes: Node<FunctionNodeData>[] = [];
-
-  // Connected functions follow the function supplying their input.
-  // Preserve graph order among functions that are ready at the same time.
+  const dependencies = new Map(functionNodes.map((node) => [node.id, new Set<string>()]));
+  for (const edge of edges) {
+    const isOrder = edge.data?.connectionType === "order";
+    const sourceId = edge.source;
+    const targetId = edge.target;
+    if (!functionNodeIds.has(sourceId) || !functionNodeIds.has(targetId) || sourceId === targetId) continue;
+    // Data edges mean the producer must be emitted before the consumer.
+    if (isOrder || edge.sourceHandle?.startsWith("out:") && edge.targetHandle?.startsWith("in:")) dependencies.get(targetId)!.add(sourceId);
+  }
   while (pending.length > 0) {
-    const readyIndex = pending.findIndex((node) =>
-      !edges.some((edge) =>
-        edge.target === node.id &&
-        edge.source !== node.id &&
-        functionNodeIds.has(edge.source) &&
-        pending.some((candidate) => candidate.id === edge.source),
-      ),
-    );
-    if (readyIndex < 0) {
-      orderedNodes.push(...pending);
-      break;
-    }
+    const readyIndex = pending.findIndex((node) => [...dependencies.get(node.id)!].every((sourceId) => !pending.some((candidate) => candidate.id === sourceId)));
+    if (readyIndex < 0) throw new Error("Code generation order is contradictory or circular. Check purple order connections and normal data dependencies.");
     orderedNodes.push(pending.splice(readyIndex, 1)[0]);
   }
 
@@ -143,6 +149,16 @@ export function generateSource(nodes: Node<FunctionNodeData>[], edges: Edge[]): 
       values.set(input.id, edge && edge.sourceHandle
         ? resolveOutput(edge.source, edge.sourceHandle.replace(/^out:/, ""), new Set([node.id]))
         : parameter?.value ?? "");
+    }
+    if (node.data.show === false) {
+      const logic = node.data.template.trim();
+      const hasAssignment = /(?<![<>=!])=(?!=|>)/.test(logic);
+      const hasCall = /\b[A-Za-z_]\w*\s*\(/.test(logic);
+      const hasStatementKeyword = /\b(?:return|yield|raise|import|from|def|class|delete|throw|await)\b/.test(logic);
+      if (logic && (hasAssignment || hasCall || hasStatementKeyword)) {
+        throw new Error(`Node “${node.data.label}” is hidden but its Logic may have side effects or be a statement. Keep Show enabled to preserve program behavior.`);
+      }
+      return "";
     }
     return substituteInputs(node.data.template, values);
   });

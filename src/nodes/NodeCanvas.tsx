@@ -4,6 +4,7 @@ import {
   addEdge,
   Background,
   BackgroundVariant,
+  ConnectionMode,
   Controls,
   MiniMap,
   ReactFlow,
@@ -24,7 +25,10 @@ import { VisualNode } from "./VisualNode";
 
 import {
   arePortTypesCompatible,
+  isOrderEdge,
+  getOrderEndpoints,
   normalizeNodeData,
+  wouldCreateOrderCycle,
   type FunctionNodeData,
   type NodeDefinition,
   type NodePort,
@@ -135,6 +139,12 @@ export default function NodeCanvas({
 
   const isValidConnection = useCallback(
     (connection: Connection | Edge) => {
+      const orderEndpoints = getOrderEndpoints(connection);
+      if (connection.sourceHandle?.startsWith("order:") || connection.targetHandle?.startsWith("order:")) {
+        if (!orderEndpoints || !nodes.some((node) => node.id === orderEndpoints.source) || !nodes.some((node) => node.id === orderEndpoints.target) || orderEndpoints.source === orderEndpoints.target) return false;
+        if (edges.some((edge) => isOrderEdge(edge) && edge.source === orderEndpoints.source && edge.target === orderEndpoints.target)) return false;
+        return !wouldCreateOrderCycle(edges, orderEndpoints.source, orderEndpoints.target);
+      }
       const sourceNode = nodes.find(
         (node) => node.id === connection.source
       );
@@ -152,6 +162,7 @@ export default function NodeCanvas({
       if (!sourceNode || !targetNode) {
         return false;
       }
+      if (wouldCreateOrderCycle(edges, connection.source!, connection.target!)) return false;
 
       // Prevent connecting a node to itself.
       if (connection.source === connection.target) {
@@ -201,13 +212,16 @@ export default function NodeCanvas({
         return;
       }
 
+      const orderEndpoints = getOrderEndpoints(connection);
+      const ordering = Boolean(orderEndpoints);
+      const normalizedConnection = ordering ? { ...connection, source: orderEndpoints!.source, sourceHandle: "order:out", target: orderEndpoints!.target, targetHandle: "order:in" } : connection;
       const sourceNode = nodes.find(
-        (node) => node.id === connection.source
+        (node) => node.id === normalizedConnection.source
       );
 
       const sourcePort = getPort(
         sourceNode,
-        connection.sourceHandle,
+        normalizedConnection.sourceHandle,
         "output"
       );
 
@@ -215,24 +229,26 @@ export default function NodeCanvas({
         sourcePort?.type === "exec";
 
       const newEdge: Edge = {
-        ...connection,
+        ...normalizedConnection,
         id: crypto.randomUUID(),
         type: "smoothstep",
-        animated: isExecutionConnection,
+        data: ordering ? { connectionType: "order" } : undefined,
+        animated: isExecutionConnection || ordering,
         style: {
-          stroke: isExecutionConnection ? "#f4f4f5" : "#60a5fa",
+          stroke: ordering ? "#b56cff" : isExecutionConnection ? "#f4f4f5" : "#60a5fa",
           strokeWidth: 2,
         },
         markerEnd: {
           type: MarkerType.ArrowClosed,
-          color: isExecutionConnection ? "#f4f4f5" : "#60a5fa",
+          color: ordering ? "#b56cff" : isExecutionConnection ? "#f4f4f5" : "#60a5fa",
         },
       };
 
       setEdges((currentEdges) => {
-        if (currentEdges.some((edge) =>
-          (edge.source === connection.source && edge.sourceHandle === connection.sourceHandle) ||
-          (edge.target === connection.target && edge.targetHandle === connection.targetHandle)
+        if (ordering && (currentEdges.some((edge) => isOrderEdge(edge) && edge.source === normalizedConnection.source && edge.target === normalizedConnection.target) || wouldCreateOrderCycle(currentEdges, normalizedConnection.source!, normalizedConnection.target!))) return currentEdges;
+        if (!ordering && currentEdges.some((edge) =>
+          (edge.source === normalizedConnection.source && edge.sourceHandle === normalizedConnection.sourceHandle) ||
+          (edge.target === normalizedConnection.target && edge.targetHandle === normalizedConnection.targetHandle)
         )) return currentEdges;
         return addEdge(newEdge, currentEdges);
       });
@@ -244,6 +260,7 @@ export default function NodeCanvas({
   const styledEdges = useMemo(
     () =>
       edges.map((edge) => {
+        const ordering = isOrderEdge(edge);
         const sourceNode = nodes.find(
           (node) => node.id === edge.source
         );
@@ -260,15 +277,15 @@ export default function NodeCanvas({
         return {
           ...edge,
           type: edge.type ?? "smoothstep",
-          animated: edge.animated ?? isExecutionConnection,
+          animated: edge.animated ?? (isExecutionConnection || ordering),
           style: {
-            stroke: isExecutionConnection ? "#f4f4f5" : "#60a5fa",
+            stroke: ordering ? "#b56cff" : isExecutionConnection ? "#f4f4f5" : "#60a5fa",
             strokeWidth: 2,
             ...edge.style,
           },
           markerEnd: edge.markerEnd ?? {
             type: MarkerType.ArrowClosed,
-            color: isExecutionConnection ? "#f4f4f5" : "#60a5fa",
+            color: ordering ? "#b56cff" : isExecutionConnection ? "#f4f4f5" : "#60a5fa",
           },
         };
       }),
@@ -301,6 +318,7 @@ export default function NodeCanvas({
         }}
       >
         <ReactFlow<Node<FunctionNodeData>, Edge>
+          connectionMode={ConnectionMode.Loose}
           nodes={nodes}
           edges={styledEdges}
           nodeTypes={nodeTypes}

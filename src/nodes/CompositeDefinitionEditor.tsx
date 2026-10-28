@@ -1,18 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { applyEdgeChanges, applyNodeChanges, Background, Controls, ReactFlow, type Connection, type Edge, type Node, type NodeChange, type ReactFlowInstance } from "@xyflow/react";
+import { applyEdgeChanges, applyNodeChanges, Background, Controls, ConnectionMode, ReactFlow, type Connection, type Edge, type Node, type NodeChange, type ReactFlowInstance } from "@xyflow/react";
 import { invoke } from "@tauri-apps/api/core";
-import { arePortTypesCompatible, DEFAULT_NODE_PARAMETER_EDITABILITY, retainValidSinglePortConnections, type CompositeInputMapping, type CompositeOutputMapping, type CompositeParameter, type FunctionNodeData, type NodeDefinition, type NodePort } from "./nodeDefinitions";
+import { arePortTypesCompatible, DEFAULT_NODE_PARAMETER_EDITABILITY, getOrderEndpoints, isOrderEdge, retainValidSinglePortConnections, wouldCreateOrderCycle, type CompositeInputMapping, type CompositeOutputMapping, type CompositeParameter, type FunctionNodeData, type NodeDefinition, type NodePort } from "./nodeDefinitions";
 import { VisualNode } from "./VisualNode";
 import "./nodes.css";
 
 const nodeTypes = { function: VisualNode };
 const ports = (count: number, direction: "input" | "output", current: NodePort[]) => Array.from({ length: Math.max(0, Math.min(16, count)) }, (_, index) => current[index] ?? ({ id: `${direction}${index + 1}`, label: `${direction === "input" ? "Input" : "Output"} ${index + 1}`, type: "text" as const }));
 
-type Props = { initialDefinition: NodeDefinition; libraryFolder: string; targetExtension: string; isNew?: boolean; minimumInputs?: number; minimumOutputs?: number; onCancel: () => void; onSaved: (definition: NodeDefinition) => void; onAddNodeHandler: (handler: ((definition: NodeDefinition) => void) | null) => void };
+type Props = { initialDefinition: NodeDefinition; libraryFolder: string; targetExtension: string; themeMode: "dark" | "light"; isNew?: boolean; minimumInputs?: number; minimumOutputs?: number; onCancel: () => void; onSaved: (definition: NodeDefinition) => void; onAddNodeHandler: (handler: ((definition: NodeDefinition) => void) | null) => void };
 
-export default function CompositeDefinitionEditor({ initialDefinition, libraryFolder, targetExtension, isNew = false, minimumInputs = 0, minimumOutputs = 0, onCancel, onSaved, onAddNodeHandler }: Props) {
+export default function CompositeDefinitionEditor({ initialDefinition, libraryFolder, targetExtension, themeMode, isNew = false, minimumInputs = 0, minimumOutputs = 0, onCancel, onSaved, onAddNodeHandler }: Props) {
   const [name, setName] = useState(initialDefinition.name);
   const [category, setCategory] = useState(initialDefinition.category ?? "Default");
+  const [show, setShow] = useState(initialDefinition.show ?? true);
   const [nodes, setNodes] = useState<Node<FunctionNodeData>[]>(initialDefinition.definitionGraph?.nodes ?? []);
   const [edges, setEdges] = useState<Edge[]>(() => retainValidSinglePortConnections(initialDefinition.definitionGraph?.nodes ?? [], initialDefinition.definitionGraph?.edges ?? []));
   const [inputs, setInputs] = useState(initialDefinition.inputs);
@@ -44,19 +45,25 @@ export default function CompositeDefinitionEditor({ initialDefinition, libraryFo
   }, [edges, nodes]);
   const onConnect = useCallback((connection: Connection) => {
     if (!connection.source || !connection.target || !connection.sourceHandle || !connection.targetHandle || connection.source === connection.target) return;
+    const orderEndpoints = getOrderEndpoints(connection);
+    if (connection.sourceHandle.startsWith("order:") || connection.targetHandle.startsWith("order:")) {
+      if (!orderEndpoints) return;
+      setEdges((current) => current.some((edge) => isOrderEdge(edge) && edge.source === orderEndpoints.source && edge.target === orderEndpoints.target) || wouldCreateOrderCycle(current, orderEndpoints.source, orderEndpoints.target) ? current : [...current, { ...connection, source: orderEndpoints.source, sourceHandle: "order:out", target: orderEndpoints.target, targetHandle: "order:in", id: crypto.randomUUID(), type: "smoothstep", data: { connectionType: "order" }, animated: true, style: { stroke: "#b56cff", strokeWidth: 2 } }]);
+      return;
+    }
     const source = nodes.find((node) => node.id === connection.source);
     const target = nodes.find((node) => node.id === connection.target);
     const output = source?.data.outputs.find((port) => `out:${port.id}` === connection.sourceHandle);
     const input = target?.data.inputs.find((port) => `in:${port.id}` === connection.targetHandle);
-    if (!output || !input || !arePortTypesCompatible(output.type, input.type)) return;
+    if (!output || !input || !arePortTypesCompatible(output.type, input.type) || wouldCreateOrderCycle(edges, connection.source, connection.target)) return;
     setEdges((current) => {
       if (current.some((edge) => edge.source === connection.source && edge.sourceHandle === connection.sourceHandle || edge.target === connection.target && edge.targetHandle === connection.targetHandle)) return current;
       return [...current, { ...connection, id: crypto.randomUUID(), type: "smoothstep" }];
     });
-  }, [nodes]);
+  }, [edges, nodes]);
   const addInternalNode = useCallback((definition: NodeDefinition, position: { x: number; y: number }) => {
     if (definition.id === initialDefinition.id) return;
-    const data: FunctionNodeData = { label: definition.name, description: definition.description, kind: definition.kind, inputs: definition.inputs, outputs: definition.outputs, template: definition.template, outputTemplates: definition.outputTemplates, definitionId: definition.id, definitionGraph: definition.definitionGraph, valueParameters: definition.valueParameters, editableParameters: definition.editableParameters, compositeInputMappings: definition.compositeInputMappings, compositeOutputMappings: definition.compositeOutputMappings, compositeParameters: definition.compositeParameters, value: "", color: definition.color ?? "#24344c" };
+    const data: FunctionNodeData = { label: definition.name, description: definition.description, kind: definition.kind, show: definition.show ?? true, inputs: definition.inputs, outputs: definition.outputs, template: definition.template, outputTemplates: definition.outputTemplates, definitionId: definition.id, definitionGraph: definition.definitionGraph, valueParameters: definition.valueParameters, editableParameters: definition.editableParameters, compositeInputMappings: definition.compositeInputMappings, compositeOutputMappings: definition.compositeOutputMappings, compositeParameters: definition.compositeParameters, value: "", color: definition.color ?? "#24344c" };
     setNodes((current) => [...current, { id: crypto.randomUUID(), type: "function", position, data }]);
   }, [initialDefinition.id]);
   const onDrop = useCallback((event: React.DragEvent) => {
@@ -96,7 +103,7 @@ export default function CompositeDefinitionEditor({ initialDefinition, libraryFo
   }
   async function save() {
     if (!name.trim()) { setMessage("Enter a name for this Composite Node."); return; }
-    const definition: NodeDefinition = { ...initialDefinition, id: initialDefinition.id, name: name.trim(), kind: "composite", inputs, outputs, template: "", outputTemplates: outputs.map(() => ""), category, language: targetExtension,
+    const definition: NodeDefinition = { ...initialDefinition, id: initialDefinition.id, name: name.trim(), kind: "composite", show, inputs, outputs, template: "", outputTemplates: outputs.map(() => ""), category, language: targetExtension,
       definitionGraph: { nodes, edges }, compositeInputMappings: inputMappings.filter((mapping) => inputs.some((input) => input.id === mapping.inputId) && nodes.some((node) => node.id === mapping.nodeId && node.data.inputs.some((port) => port.id === mapping.nodeInputId))),
       compositeOutputMappings: outputMappings.filter((mapping) => outputs.some((output) => output.id === mapping.outputId) && nodes.some((node) => node.id === mapping.nodeId && node.data.outputs.some((port) => port.id === mapping.nodeOutputId))),
       compositeParameters: parameters.flatMap((parameter) => {
@@ -118,21 +125,24 @@ export default function CompositeDefinitionEditor({ initialDefinition, libraryFo
   return <div className="function-definition-editor composite-definition-editor">
     <div className="definition-editor-toolbar"><div><strong>{isNew ? "Define Composite Node" : "Edit Composite Node"}</strong><span>Configure its public interface around the internal graph</span></div><button className="cancel-button" onClick={onCancel}>Back to graph</button></div>
     <div ref={canvasRef} className="composite-internal-workspace" onDrop={onDrop} onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "copy"; }}><div className="composite-internal-heading">Internal network · nodes inside this boundary define the Composite Node</div>
-      <ReactFlow<Node<FunctionNodeData>, Edge> nodes={nodes} edges={edges} nodeTypes={nodeTypes}
+      <ReactFlow<Node<FunctionNodeData>, Edge> connectionMode={ConnectionMode.Loose} colorMode={themeMode} nodes={nodes} edges={edges} nodeTypes={nodeTypes}
         onNodesChange={(changes: NodeChange<Node<FunctionNodeData>>[]) => setNodes((current) => applyNodeChanges(changes, current))}
         onEdgesChange={(changes) => setEdges((current) => retainValidSinglePortConnections(nodes, applyEdgeChanges(changes, current)))} onConnect={onConnect} onInit={(instance) => { flow.current = instance; }}
         isValidConnection={(connection) => {
           if (!connection.source || !connection.target || !connection.sourceHandle || !connection.targetHandle || connection.source === connection.target) return false;
+          const orderEndpoints = getOrderEndpoints(connection);
+          if (connection.sourceHandle.startsWith("order:") || connection.targetHandle.startsWith("order:")) return Boolean(orderEndpoints && !edges.some((edge) => isOrderEdge(edge) && edge.source === orderEndpoints.source && edge.target === orderEndpoints.target) && !wouldCreateOrderCycle(edges, orderEndpoints.source, orderEndpoints.target));
           const source = nodes.find((node) => node.id === connection.source);
           const target = nodes.find((node) => node.id === connection.target);
           const output = source?.data.outputs.find((port) => `out:${port.id}` === connection.sourceHandle);
           const input = target?.data.inputs.find((port) => `in:${port.id}` === connection.targetHandle);
-          return Boolean(output && input && arePortTypesCompatible(output.type, input.type) && !edges.some((edge) => edge.source === connection.source && edge.sourceHandle === connection.sourceHandle || edge.target === connection.target && edge.targetHandle === connection.targetHandle));
+          return Boolean(output && input && arePortTypesCompatible(output.type, input.type) && !wouldCreateOrderCycle(edges, connection.source, connection.target) && !edges.some((edge) => edge.source === connection.source && edge.sourceHandle === connection.sourceHandle || edge.target === connection.target && edge.targetHandle === connection.targetHandle));
         }}
-        onNodeDoubleClick={(_event, node) => setSettingsNodeId(node.id)} onNodeContextMenu={(event, node) => { event.preventDefault(); setSettingsNodeId(node.id); }} fitView colorMode="dark" deleteKeyCode={["Backspace", "Delete"]}>
-        <Background color="#303c50" gap={22} size={1} /><Controls />
+        onNodeDoubleClick={(_event, node) => setSettingsNodeId(node.id)} onNodeContextMenu={(event, node) => { event.preventDefault(); setSettingsNodeId(node.id); }} fitView deleteKeyCode={["Backspace", "Delete"]}>
+        <Background color={themeMode === "light" ? "#b8c4d4" : "#303c50"} gap={22} size={1} /><Controls />
       </ReactFlow>
       {selectedNode && <div className="node-instance-settings definition-value-settings"><header><strong>Internal node settings</strong><button onClick={() => setSettingsNodeId("")}>×</button></header>
+        {selectedNode.data.kind !== "value" && <label className="show-generated-setting"><span>Show generated text</span><input type="checkbox" checked={selectedNode.data.show !== false} onChange={(event) => updateInternalNode({ show: event.target.checked })} /></label>}
         {(!internalDefinitionLocked || internalEditability.name) && <label>Name<input value={selectedNode.data.label} onChange={(event) => updateInternalNode({ label: event.target.value })} /></label>}
         <label>Color<input type="color" value={selectedNode.data.color ?? "#24344c"} onChange={(event) => updateInternalNode({ color: event.target.value })} /></label>
         {internalDefinitionLocked && internalEditability.description && <label>Description<input value={selectedNode.data.description} onChange={(event) => updateInternalNode({ description: event.target.value })} /></label>}
@@ -146,12 +156,13 @@ export default function CompositeDefinitionEditor({ initialDefinition, libraryFo
     </div>
     <div className="composite-public-interface">
       <label>Name<input value={name} onChange={(event) => setName(event.target.value)} /></label>
+      <label className="definition-show-default"><span>Show by default</span><input type="checkbox" checked={show} onChange={(event) => setShow(event.target.checked)} /></label>
       <label>Category/subcategory<input value={category} onChange={(event) => setCategory(event.target.value)} /></label>
       <label>Inputs<input type="number" min={minimumInputs} max="16" value={inputs.length} onChange={(event) => { const next = ports(Math.max(minimumInputs, Number(event.target.value)), "input", inputs); setInputs(next); setInputMappings((current) => current.filter((mapping) => next.some((port) => port.id === mapping.inputId))); }} /></label>
       <div className="composite-mappings"><strong>Outer inputs → internal inputs</strong>{inputs.map((port, index) => <label key={port.id}>input{index + 1}<select value={inputMappings.find((mapping) => mapping.inputId === port.id) ? `${inputMappings.find((mapping) => mapping.inputId === port.id)!.nodeId}|${inputMappings.find((mapping) => mapping.inputId === port.id)!.nodeInputId}` : ""} onChange={(event) => { const [nodeId, nodeInputId] = event.target.value.split("|"); setInputMappings((current) => [...current.filter((mapping) => mapping.inputId !== port.id), ...(nodeId ? [{ inputId: port.id, nodeId, nodeInputId }] : [])]); }}><option value="">Unmapped</option>{internalInputs.filter((target) => !inputMappings.some((mapping) => mapping.inputId !== port.id && mapping.nodeId === target.nodeId && mapping.nodeInputId === target.portId)).map((target) => <option key={`${target.nodeId}|${target.portId}`} value={`${target.nodeId}|${target.portId}`}>{target.nodeName} · {target.portId}</option>)}</select></label>)}</div>
       <label>Outputs<input type="number" min={minimumOutputs} max="16" value={outputs.length} onChange={(event) => { const next = ports(Math.max(minimumOutputs, Number(event.target.value)), "output", outputs); setOutputs(next); setOutputMappings((current) => current.filter((mapping) => next.some((port) => port.id === mapping.outputId))); }} /></label>
       <div className="composite-mappings"><strong>Internal outputs → outer outputs</strong>{outputs.map((port, index) => <label key={port.id}>output{index + 1}<select value={outputMappings.find((mapping) => mapping.outputId === port.id) ? `${outputMappings.find((mapping) => mapping.outputId === port.id)!.nodeId}|${outputMappings.find((mapping) => mapping.outputId === port.id)!.nodeOutputId}` : ""} onChange={(event) => { const [nodeId, nodeOutputId] = event.target.value.split("|"); setOutputMappings((current) => [...current.filter((mapping) => mapping.outputId !== port.id), ...(nodeId ? [{ outputId: port.id, nodeId, nodeOutputId }] : [])]); }}><option value="">Unmapped</option>{internalOutputs.filter((target) => !outputMappings.some((mapping) => mapping.outputId !== port.id && mapping.nodeId === target.nodeId && mapping.nodeOutputId === target.portId)).map((target) => <option key={`${target.nodeId}|${target.portId}`} value={`${target.nodeId}|${target.portId}`}>{target.nodeName} · {target.portId}</option>)}</select></label>)}</div>
-      <div className="composite-mappings"><strong>Exposed internal parameters</strong><select value="" onChange={(event) => { const source = parameterSources.find((item) => item.id === event.target.value); if (source && !parameters.some((parameter) => parameter.id === source.id)) setParameters((current) => [...current, { id: source.id, name: source.name, sourceNodeId: source.sourceNodeId, targetNodeId: source.targetNodeId, inputId: source.inputId, value: source.value, sourceKind: source.sourceKind, editable: true }]); }}><option value="">Expose a parameter…</option>{parameterSources.filter((source) => !parameters.some((parameter) => parameter.id === source.id)).map((source) => <option key={source.id} value={source.id}>{source.display}</option>)}</select>{parameters.map((parameter) => <label key={parameter.id}><input aria-label="Outer parameter name" value={parameter.name} onChange={(event) => setParameters((current) => current.map((item) => item.id === parameter.id ? { ...item, name: event.target.value } : item))} /><span><input type="checkbox" checked={parameter.editable} onChange={(event) => setParameters((current) => current.map((item) => item.id === parameter.id ? { ...item, editable: event.target.checked } : item))} /> Editable</span><button type="button" onClick={() => setParameters((current) => current.filter((item) => item.id !== parameter.id))}>×</button></label>)}</div>
+      <div className="composite-mappings"><strong>Exposed internal parameters</strong><select value="" onChange={(event) => { const source = parameterSources.find((item) => item.id === event.target.value); if (source && !parameters.some((parameter) => parameter.id === source.id)) setParameters((current) => [...current, { id: source.id, name: source.name, label: "", sourceNodeId: source.sourceNodeId, targetNodeId: source.targetNodeId, inputId: source.inputId, value: source.value, sourceKind: source.sourceKind, editable: true }]); }}><option value="">Expose a parameter…</option>{parameterSources.filter((source) => !parameters.some((parameter) => parameter.id === source.id)).map((source) => <option key={source.id} value={source.id}>{source.display}</option>)}</select>{parameters.map((parameter) => <div className="composite-exposed-parameter" key={parameter.id}><input aria-label="Outer parameter name" value={parameter.name} onChange={(event) => setParameters((current) => current.map((item) => item.id === parameter.id ? { ...item, name: event.target.value } : item))} /><input aria-label="Outer parameter display label" placeholder={parameter.name} value={parameter.label ?? ""} onChange={(event) => setParameters((current) => current.map((item) => item.id === parameter.id ? { ...item, label: event.target.value } : item))} /><span><input type="checkbox" checked={parameter.editable} onChange={(event) => setParameters((current) => current.map((item) => item.id === parameter.id ? { ...item, editable: event.target.checked } : item))} /> Editable</span><button type="button" onClick={() => setParameters((current) => current.filter((item) => item.id !== parameter.id))}>×</button></div>)}</div>
       <label>Save<button className="save-button" disabled={saving} onClick={() => void save()}>{saving ? "Saving…" : "Save Composite"}</button></label>
       {message && <small>{message}</small>}
     </div>

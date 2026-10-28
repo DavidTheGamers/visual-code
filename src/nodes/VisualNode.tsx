@@ -42,6 +42,8 @@ export function VisualNode({ id, data, selected }: NodeProps<Node<FunctionNodeDa
       />
       {renderPorts(data.inputs, "input")}
       {renderPorts(data.outputs, "output")}
+      <Handle id="order:in" type="target" position={Position.Top} title="Order after this node" aria-label="Order after this node" className="vc-order-handle vc-order-target" />
+      <Handle id="order:out" type="source" position={Position.Bottom} title="Order before connected node" aria-label="Order before connected node" className="vc-order-handle vc-order-source" />
       <div className="vc-node-header">
         <span className="vc-node-symbol">{data.kind === "value" ? "◇" : data.kind === "composite" ? "▧" : "ƒ"}</span>
         <strong>{data.label}</strong>
