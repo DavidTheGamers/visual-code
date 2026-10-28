@@ -88,12 +88,45 @@ export function generateSource(nodes: Node<FunctionNodeData>[], edges: Edge[]): 
     return depth === 0 && !quote;
   };
 
-  const substituteInputs = (text: string, values: Map<string, string>) =>
+  
+  const isLogicOutput = (edge: Edge | undefined) => {
+    if (!edge?.sourceHandle) return false;
+
+    const sourceNode = byId.get(edge.source);
+    if (!sourceNode || sourceNode.data.kind !== "function") {
+      return false;
+    }
+
+    const sourcePortId = edge.sourceHandle.replace(/^out:/, "");
+    const outputIndex = (sourceNode.data.outputs ?? []).findIndex(
+      (output) => output.id === sourcePortId
+    );
+
+    return outputIndex >= 0 &&
+      sourceNode.data.outputTemplates?.[outputIndex] === "Logic";
+  };
+
+  const substituteInputs = (
+    text: string,
+    values: Map<string, string>,
+    unwrappedInputs: Set<string> = new Set()
+  ) =>
     text.replace(/\binput(\d+)\b/g, (_match, index: string) => {
-      const value = values.get("input" + index) ?? "";
-      if (!value.trim() || isAtomicExpression(value) || isFullyParenthesized(value)) return value;
+      const inputId = "input" + index;
+      const value = values.get(inputId) ?? "";
+
+      if (
+        unwrappedInputs.has(inputId) ||
+        !value.trim() ||
+        isAtomicExpression(value) ||
+        isFullyParenthesized(value)
+      ) {
+        return value;
+      }
+
       return "(" + value + ")";
     });
+
 
   const resolveOutput = (nodeId: string, portId: string, stack: Set<string>): string => {
     const key = nodeId + ":" + portId;
@@ -108,16 +141,41 @@ export function generateSource(nodes: Node<FunctionNodeData>[], edges: Edge[]): 
     const nextStack = new Set(stack);
     nextStack.add(nodeId);
     const values = new Map<string, string>();
+    
+    const logicInputs = new Set<string>();
+
     for (const input of data.inputs ?? []) {
-      const edge = edges.find((item) => item.target === nodeId && item.targetHandle === "in:" + input.id);
-      const parameter = data.valueParameters?.find((item) => item.inputId === input.id);
-      values.set(input.id, edge && edge.sourceHandle
-        ? resolveOutput(edge.source, edge.sourceHandle.replace(/^out:/, ""), nextStack)
-        : parameter?.value ?? "");
+      const edge = edges.find(
+        (item) =>
+          item.target === nodeId &&
+          item.targetHandle === "in:" + input.id
+      );
+
+      if (edge && isLogicOutput(edge)) {
+        logicInputs.add(input.id);
+      }
+
+      const parameter = data.valueParameters?.find(
+        (item) => item.inputId === input.id
+      );
+
+      values.set(
+        input.id,
+        edge && edge.sourceHandle
+          ? resolveOutput(
+              edge.source,
+              edge.sourceHandle.replace(/^out:/, ""),
+              nextStack
+            )
+          : parameter?.value ?? ""
+      );
     }
+
     const outputIndex = (data.outputs ?? []).findIndex((port) => port.id === portId);
     const mapping = data.outputTemplates?.[outputIndex] ?? "";
-    const output = mapping === "Logic" ? substituteInputs(data.template, values) : substituteInputs(mapping, values);
+    const output = mapping === "Logic"
+  ? substituteInputs(data.template, values, logicInputs)
+  : substituteInputs(mapping, values, logicInputs);
     cache.set(key, output);
     return output;
   };
@@ -143,13 +201,36 @@ export function generateSource(nodes: Node<FunctionNodeData>[], edges: Edge[]): 
 
   const statements = orderedNodes.map((node) => {
     const values = new Map<string, string>();
+    
+    const logicInputs = new Set<string>();
+
     for (const input of node.data.inputs ?? []) {
-      const edge = edges.find((item) => item.target === node.id && item.targetHandle === "in:" + input.id);
-      const parameter = node.data.valueParameters?.find((item) => item.inputId === input.id);
-      values.set(input.id, edge && edge.sourceHandle
-        ? resolveOutput(edge.source, edge.sourceHandle.replace(/^out:/, ""), new Set([node.id]))
-        : parameter?.value ?? "");
+      const edge = edges.find(
+        (item) =>
+          item.target === node.id &&
+          item.targetHandle === "in:" + input.id
+      );
+
+      if (edge && isLogicOutput(edge)) {
+        logicInputs.add(input.id);
+      }
+
+      const parameter = node.data.valueParameters?.find(
+        (item) => item.inputId === input.id
+      );
+
+      values.set(
+        input.id,
+        edge && edge.sourceHandle
+          ? resolveOutput(
+              edge.source,
+              edge.sourceHandle.replace(/^out:/, ""),
+              new Set([node.id])
+            )
+          : parameter?.value ?? ""
+      );
     }
+
     if (node.data.show === false) {
       const logic = node.data.template.trim();
       const hasAssignment = /(?<![<>=!])=(?!=|>)/.test(logic);
@@ -160,7 +241,7 @@ export function generateSource(nodes: Node<FunctionNodeData>[], edges: Edge[]): 
       }
       return "";
     }
-    return substituteInputs(node.data.template, values);
+    return substituteInputs(node.data.template, values, logicInputs);
   });
 
   return statements.filter((line) => line.length > 0).join("\n") + (statements.some(Boolean) ? "\n" : "");
