@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ReactFlow,
+  SelectionMode,
   Background,
   Controls,
   MiniMap,
@@ -24,12 +25,15 @@ import {
   createNodeData,
   DEFAULT_NODE_PARAMETER_EDITABILITY,
   normalizeLanguageExtension,
+  retainValidSinglePortConnections,
   type FunctionNodeData,
   type NodeDefinition,
   type NodePort,
 } from "./nodes/nodeDefinitions";
 import { VisualNode } from "./nodes/VisualNode";
 import FunctionDefinitionEditor from "./nodes/FunctionDefinitionEditor";
+import { generateSource } from "./nodes/codeGeneration";
+import CompositeDefinitionEditor from "./nodes/CompositeDefinitionEditor";
 
 import "@xyflow/react/dist/style.css";
 import "./App.css";
@@ -43,6 +47,8 @@ type NodGraphFile = {
   nodes: Node<FunctionNodeData>[];
   edges: Edge[];
 };
+
+type CompositeCreationDraft = { definitionId: string; nodeIds: string[]; incomingEdges: Edge[]; outgoingEdges: Edge[]; center: { x: number; y: number } };
 
 type ProjectEntry = {
   path: string;
@@ -77,107 +83,6 @@ function folderName(path: string): string {
   return path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
 }
 
-function generateSource(nodes: Node<FunctionNodeData>[], edges: Edge[]): string {
-  const byId = new Map(nodes.map((node) => [node.id, node]));
-  const cache = new Map<string, string>();
-
-  const isAtomicExpression = (value: string) =>
-    /^(?:[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')$/.test(value.trim());
-
-  const isFullyParenthesized = (value: string) => {
-    const text = value.trim();
-    if (text.length < 2 || text[0] !== "(" || text[text.length - 1] !== ")") return false;
-    let depth = 0;
-    let quote = "";
-    let escaped = false;
-    for (let index = 0; index < text.length; index += 1) {
-      const character = text[index];
-      if (quote) {
-        if (escaped) escaped = false;
-        else if (character === "\\") escaped = true;
-        else if (character === quote) quote = "";
-        continue;
-      }
-      if (character === "'" || character === '"') { quote = character; continue; }
-      if (character === "(") depth += 1;
-      if (character === ")") {
-        depth -= 1;
-        if (depth === 0 && index !== text.length - 1) return false;
-        if (depth < 0) return false;
-      }
-    }
-    return depth === 0 && !quote;
-  };
-
-  const substituteInputs = (text: string, values: Map<string, string>) =>
-    text.replace(/\binput(\d+)\b/g, (_match, index: string) => {
-      const value = values.get("input" + index) ?? "";
-      if (!value.trim() || isAtomicExpression(value) || isFullyParenthesized(value)) return value;
-      return "(" + value + ")";
-    });
-
-  const resolveOutput = (nodeId: string, portId: string, stack: Set<string>): string => {
-    const key = nodeId + ":" + portId;
-    if (cache.has(key)) return cache.get(key)!;
-    if (stack.has(nodeId)) return "";
-
-    const node = byId.get(nodeId);
-    if (!node) return "";
-    const data = node.data;
-    if (data.kind === "value") return data.value ?? "";
-
-    const nextStack = new Set(stack);
-    nextStack.add(nodeId);
-    const values = new Map<string, string>();
-    for (const input of data.inputs ?? []) {
-      const edge = edges.find((item) => item.target === nodeId && item.targetHandle === "in:" + input.id);
-      values.set(input.id, edge && edge.sourceHandle
-        ? resolveOutput(edge.source, edge.sourceHandle.replace(/^out:/, ""), nextStack)
-        : "");
-    }
-    const outputIndex = (data.outputs ?? []).findIndex((port) => port.id === portId);
-    const mapping = data.outputTemplates?.[outputIndex] ?? "";
-    const output = mapping === "Logic" ? substituteInputs(data.template, values) : substituteInputs(mapping, values);
-    cache.set(key, output);
-    return output;
-  };
-
-  const functionNodes = nodes.filter((node) => node.data.kind === "function");
-  const functionNodeIds = new Set(functionNodes.map((node) => node.id));
-  const pending = [...functionNodes];
-  const orderedNodes: Node<FunctionNodeData>[] = [];
-
-  // Connected functions follow the function supplying their input.
-  // Preserve graph order among functions that are ready at the same time.
-  while (pending.length > 0) {
-    const readyIndex = pending.findIndex((node) =>
-      !edges.some((edge) =>
-        edge.target === node.id &&
-        edge.source !== node.id &&
-        functionNodeIds.has(edge.source) &&
-        pending.some((candidate) => candidate.id === edge.source),
-      ),
-    );
-    if (readyIndex < 0) {
-      orderedNodes.push(...pending);
-      break;
-    }
-    orderedNodes.push(pending.splice(readyIndex, 1)[0]);
-  }
-
-  const statements = orderedNodes.map((node) => {
-    const values = new Map<string, string>();
-    for (const input of node.data.inputs ?? []) {
-      const edge = edges.find((item) => item.target === node.id && item.targetHandle === "in:" + input.id);
-      values.set(input.id, edge && edge.sourceHandle
-        ? resolveOutput(edge.source, edge.sourceHandle.replace(/^out:/, ""), new Set([node.id]))
-        : "");
-    }
-    return substituteInputs(node.data.template, values);
-  });
-
-  return statements.filter((line) => line.length > 0).join("\n") + (statements.some(Boolean) ? "\n" : "");
-}
 function safeGraphFileName(name: string): string {
   return name
     .trim()
@@ -191,12 +96,29 @@ type NodeLibraryProps = {
   libraryFolder: string;
   targetExtension: string;
   onAddNode: (definition: NodeDefinition) => void;
+  onEditDefinition: (definition: NodeDefinition) => void;
   expanded: boolean;
   onExpandedChange: (expanded: boolean) => void;
   refreshVersion: number;
 };
 
-function NodeLibrary({ libraryFolder, targetExtension, onAddNode, expanded, onExpandedChange, refreshVersion }: NodeLibraryProps) {
+type NodeCategoryTree = { name: string; path: string; children: NodeCategoryTree[] };
+function buildCategoryTree(paths: string[]): NodeCategoryTree[] {
+  const roots: NodeCategoryTree[] = [];
+  for (const path of paths) {
+    let siblings = roots;
+    let currentPath = "";
+    for (const name of path.split("/")) {
+      currentPath = currentPath ? `${currentPath}/${name}` : name;
+      let node = siblings.find((candidate) => candidate.name === name);
+      if (!node) { node = { name, path: currentPath, children: [] }; siblings.push(node); }
+      siblings = node.children;
+    }
+  }
+  return roots;
+}
+
+function NodeLibrary({ libraryFolder, targetExtension, onAddNode, onEditDefinition, expanded, onExpandedChange, refreshVersion }: NodeLibraryProps) {
   const [definitions, setDefinitions] = useState<NodeDefinition[]>([]);
   const [categories, setCategories] = useState<string[]>(["Default"]);
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set(["Default"]));
@@ -204,6 +126,8 @@ function NodeLibrary({ libraryFolder, targetExtension, onAddNode, expanded, onEx
   const requestId = useRef(0);
   const [addingCategory, setAddingCategory] = useState(false);
   const [categoryName, setCategoryName] = useState("");
+  const [categoryMenu, setCategoryMenu] = useState<string | null>(null);
+  const [categoryDestination, setCategoryDestination] = useState("");
   const dragClickGuard = useRef<string | null>(null);
   const refresh = useCallback(async () => {
     const currentRequest = ++requestId.current;
@@ -237,6 +161,7 @@ function NodeLibrary({ libraryFolder, targetExtension, onAddNode, expanded, onEx
   }, [refresh, refreshVersion]);
   const extension = normalizeLanguageExtension(targetExtension);
   const visibleDefinitions = definitions.filter((definition) => !definition.language || normalizeLanguageExtension(definition.language) === extension);
+  const categoryTree = useMemo(() => buildCategoryTree(categories), [categories]);
 
   async function createCategory() {
     const name = categoryName.trim();
@@ -245,7 +170,12 @@ function NodeLibrary({ libraryFolder, targetExtension, onAddNode, expanded, onEx
       await invoke("create_node_category", { libraryFolder, category: name });
       setCategoryName("");
       setAddingCategory(false);
-      setExpandedCategories((previous) => new Set(previous).add(name));
+      setExpandedCategories((previous) => {
+        const next = new Set(previous);
+        const segments = name.split("/");
+        for (let index = 1; index <= segments.length; index += 1) next.add(segments.slice(0, index).join("/"));
+        return next;
+      });
       await refresh();
     } catch (error) {
       setMessage(String(error));
@@ -262,6 +192,27 @@ function NodeLibrary({ libraryFolder, targetExtension, onAddNode, expanded, onEx
       await invoke("move_node_definition", { libraryFolder, definitionId: definition.id, fromCategory, toCategory: destination });
       await refresh();
     } catch (error) { setMessage(String(error)); }
+  }
+
+  async function moveCategory(category: string) {
+    try {
+      await invoke("move_node_category", { libraryFolder, category, destinationParent: categoryDestination });
+      const destination = categoryDestination ? `${categoryDestination}/${category.split("/").pop()}` : category.split("/").pop() ?? category;
+      const remap = (value: string) => value === category || value.startsWith(`${category}/`) ? `${destination}${value.slice(category.length)}` : value;
+      setExpandedCategories((current) => {
+        const next = new Set([...current].map(remap));
+        const segments = destination.split("/");
+        for (let index = 1; index <= segments.length; index += 1) next.add(segments.slice(0, index).join("/"));
+        return next;
+      });
+      setCategoryMenu(null);
+      await refresh();
+    } catch (error) { setMessage(String(error)); }
+  }
+
+  async function reorderCategory(category: string, direction: "up" | "down") {
+    try { await invoke("reorder_node_category", { libraryFolder, category, direction }); await refresh(); }
+    catch (error) { setMessage(String(error)); }
   }
 
   function renderDefinition(definition: NodeDefinition, builtIn = false) {
@@ -287,14 +238,51 @@ function NodeLibrary({ libraryFolder, targetExtension, onAddNode, expanded, onEx
                 onAddNode(definition);
               }}
             >
-          <span className={`node-library-item-icon${definition.kind === "value" ? " value-icon" : " function-icon"}`}>{definition.kind === "value" ? "◇" : "ƒ"}</span>
+          <span className={`node-library-item-icon${definition.kind === "value" ? " value-icon" : " function-icon"}`}>{definition.kind === "value" ? "◇" : definition.kind === "composite" ? "▧" : "ƒ"}</span>
           <span className="node-library-item-name">{definition.name}</span>
           <span className="node-library-add">+</span>
         </button>
-        {!builtIn && <button className="node-library-move" title="Move to another category" aria-label={`Move ${definition.name}`} onClick={() => void moveDefinition(definition)}>↗</button>}
+        {!builtIn && <>
+          {(definition.kind === "function" || definition.kind === "composite") && <button className="node-library-move" title="Edit definition" aria-label={`Edit ${definition.name}`} onClick={() => onEditDefinition(definition)}>✎</button>}
+          <button className="node-library-move" title="Move to another category" aria-label={`Move ${definition.name}`} onClick={() => void moveDefinition(definition)}>↗</button>
+        </>}
       </div>
     );
   }
+
+  const renderCategory = (category: NodeCategoryTree, siblings: NodeCategoryTree[], index: number): ReactNode => {
+    const name = category.path;
+    const isOpen = expandedCategories.has(name);
+    const builtIns = name === "Default" ? BUILT_IN_NODES : [];
+    const customNodes = visibleDefinitions.filter((definition) => (definition.category ?? "Default") === name);
+    const availableParents = categories.filter((candidate) => candidate !== name && !candidate.startsWith(`${name}/`));
+    return <section className={`node-category${isOpen ? " category-open" : ""}`} key={name}>
+      <div className="node-category-heading">
+        <button className="node-category-toggle" onClick={() => setExpandedCategories((previous) => { const next = new Set(previous); if (next.has(name)) next.delete(name); else next.add(name); return next; })} aria-expanded={isOpen}>
+          <span className="node-category-chevron">{isOpen ? "⌄" : "›"}</span><span className="node-category-name">{category.name}</span><span className="node-category-count">{builtIns.length + customNodes.length}</span>
+        </button>
+        <button className="node-category-menu-trigger" title={`Category actions for ${category.name}`} aria-label={`Category actions for ${category.name}`} onClick={() => { setCategoryMenu((current) => current === name ? null : name); setCategoryDestination(category.path.includes("/") ? category.path.slice(0, category.path.lastIndexOf("/")) : ""); }}>⋯</button>
+      </div>
+      {categoryMenu === name && <div className="node-category-menu" onClick={(event) => event.stopPropagation()}>
+        <label>Move under<select value={categoryDestination} onChange={(event) => setCategoryDestination(event.target.value)}>
+          <option value="">Root</option>{availableParents.map((parent) => <option key={parent} value={parent}>{parent.split("/").join(" › ")}</option>)}
+        </select></label>
+        <button disabled={name === "Default"} onClick={() => void moveCategory(name)}>Move</button>
+        <div className="node-category-order-actions">
+          <button disabled={index === 0} title="Move up within this parent" onClick={() => void reorderCategory(name, "up")}>↑ Up</button>
+          <button disabled={index === siblings.length - 1} title="Move down within this parent" onClick={() => void reorderCategory(name, "down")}>↓ Down</button>
+        </div>
+      </div>}
+      {isOpen && <>
+        <div className="node-category-items">
+          {builtIns.map((definition) => renderDefinition(definition, true))}
+          {customNodes.map((definition) => renderDefinition(definition))}
+          {!builtIns.length && !customNodes.length && category.children.length === 0 && <p className="node-category-empty">No nodes in this category yet.</p>}
+        </div>
+        {category.children.length > 0 && <div className="node-category-children">{category.children.map((child, childIndex) => renderCategory(child, category.children, childIndex))}</div>}
+      </>}
+    </section>;
+  };
 
   return (
     <div className={`node-library-inner${expanded ? " is-expanded" : " is-collapsed"}`}>
@@ -313,28 +301,12 @@ function NodeLibrary({ libraryFolder, targetExtension, onAddNode, expanded, onEx
           <button onClick={() => { setAddingCategory((value) => !value); setMessage(""); }} aria-label="Create category" title="Create category">+</button>
         </div>
         {addingCategory && <form className="node-library-category-form" onSubmit={(event) => { event.preventDefault(); void createCategory(); }}>
-          <input autoFocus value={categoryName} onChange={(event) => setCategoryName(event.target.value)} placeholder="Category name" aria-label="Category name" />
+          <input autoFocus value={categoryName} onChange={(event) => setCategoryName(event.target.value)} placeholder="Category or Parent/Subcategory" aria-label="Category or subcategory name" />
           <button type="submit" disabled={!categoryName.trim()}>Add</button>
           <button type="button" className="category-cancel" onClick={() => { setAddingCategory(false); setCategoryName(""); }}>×</button>
         </form>}
         <div className="node-library-scroll">
-          {categories.map((name) => {
-            const isOpen = expandedCategories.has(name);
-            const builtIns = name === "Default" ? BUILT_IN_NODES : [];
-            const customNodes = visibleDefinitions.filter((definition) => (definition.category ?? "Default") === name);
-            return <section className={`node-category${isOpen ? " category-open" : ""}`} key={name}>
-              <div className="node-category-heading">
-                <button className="node-category-toggle" onClick={() => setExpandedCategories((previous) => { const next = new Set(previous); if (next.has(name)) next.delete(name); else next.add(name); return next; })} aria-expanded={isOpen}>
-                  <span className="node-category-chevron">{isOpen ? "⌄" : "›"}</span><span className="node-category-name">{name}</span><span className="node-category-count">{builtIns.length + customNodes.length}</span>
-                </button>
-              </div>
-              {isOpen && <div className="node-category-items">
-                {builtIns.map((definition) => renderDefinition(definition, true))}
-                {customNodes.map((definition) => renderDefinition(definition))}
-                {!builtIns.length && !customNodes.length && <p className="node-category-empty">No nodes in this category yet.</p>}
-              </div>}
-            </section>;
-          })}
+          {categoryTree.map((category, index) => renderCategory(category, categoryTree, index))}
           {message && <div className="node-library-message">{message}</div>}
         </div>
       </div>}
@@ -404,7 +376,10 @@ export default function App() {
   const [nodeValueOverrides, setNodeValueOverrides] = useState<Record<string, string>>({});
   const [definitionTargetNodeId, setDefinitionTargetNodeId] = useState("");
   const [definitionDraft, setDefinitionDraft] = useState<NodeDefinition | null>(null);
+  const [compositeCreationDraft, setCompositeCreationDraft] = useState<CompositeCreationDraft | null>(null);
   const [nodeLibraryRefreshVersion, setNodeLibraryRefreshVersion] = useState(0);
+  const definitionAddNodeHandler = useRef<((definition: NodeDefinition) => void) | null>(null);
+  const registerDefinitionAddNodeHandler = useCallback((handler: ((definition: NodeDefinition) => void) | null) => { definitionAddNodeHandler.current = handler; }, []);
   const mainFlowInstance = useRef<ReactFlowInstance<Node<FunctionNodeData>, Edge> | null>(null);
   const [nodeLibraryExpanded, setNodeLibraryExpanded] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(260);
@@ -662,13 +637,22 @@ export default function App() {
       const sourcePort = getPort(sourceNode, connection.sourceHandle, "output");
       const targetPort = getPort(targetNode, connection.targetHandle, "input");
 
+      // Ports are single-connection endpoints. Ignore the same edge when
+      // validating an existing edge, but never replace another connection.
+      const connectionId = "id" in connection ? connection.id : undefined;
+      const occupied = edges.some((edge) => edge.id !== connectionId && (
+        (edge.source === connection.source && edge.sourceHandle === connection.sourceHandle) ||
+        (edge.target === connection.target && edge.targetHandle === connection.targetHandle)
+      ));
+      if (occupied) return false;
+
       return Boolean(
         sourcePort &&
           targetPort &&
           arePortTypesCompatible(sourcePort.type, targetPort.type),
       );
     },
-    [getPort, nodes],
+    [edges, getPort, nodes],
   );
 
   const onConnect = useCallback(
@@ -680,8 +664,14 @@ export default function App() {
       const isExecutionConnection = sourcePort?.type === "exec";
       const edgeColor = isExecutionConnection ? "#f4f4f5" : "#60a5fa";
 
-      setEdges((current) =>
-        addEdge(
+      setEdges((current) => {
+        // Recheck against the latest state so rapid or concurrent connection
+        // gestures cannot claim the same input or output.
+        if (current.some((edge) =>
+          (edge.source === connection.source && edge.sourceHandle === connection.sourceHandle) ||
+          (edge.target === connection.target && edge.targetHandle === connection.targetHandle)
+        )) return current;
+        return addEdge(
           {
             ...connection,
             id: crypto.randomUUID(),
@@ -697,12 +687,12 @@ export default function App() {
             },
           },
           current,
-        ),
-      );
+        );
+      });
 
       setIsDirty(true);
     },
-    [getPort, isValidConnection, nodes, setEdges],
+    [edges, getPort, isValidConnection, nodes, setEdges],
   );
 
   const handleNodesChange = useCallback<
@@ -722,6 +712,31 @@ export default function App() {
     },
     [onEdgesChange],
   );
+
+  function createCompositeFromSelection() {
+    const selected = nodes.filter((node) => node.selected);
+    if (selected.length < 2) return;
+    if (!nodeLibraryFolder.trim()) { setNotice("Choose a Node Library folder before creating a reusable Composite Node."); return; }
+    const selectedIds = new Set(selected.map((node) => node.id));
+    const internalEdges = edges.filter((edge) => selectedIds.has(edge.source) && selectedIds.has(edge.target));
+    const incomingEdges = edges.filter((edge) => !selectedIds.has(edge.source) && selectedIds.has(edge.target));
+    const outgoingEdges = edges.filter((edge) => selectedIds.has(edge.source) && !selectedIds.has(edge.target));
+    const inputs = incomingEdges.map((_edge, index) => ({ id: `input${index + 1}`, label: `Input ${index + 1}`, type: "text" as const }));
+    const outputs = outgoingEdges.map((_edge, index) => ({ id: `output${index + 1}`, label: `Output ${index + 1}`, type: "text" as const }));
+    const compositeInputMappings = incomingEdges.map((edge, index) => ({ inputId: inputs[index].id, nodeId: edge.target, nodeInputId: (edge.targetHandle ?? "").replace(/^in:/, "") }));
+    const compositeOutputMappings = outgoingEdges.map((edge, index) => ({ outputId: outputs[index].id, nodeId: edge.source, nodeOutputId: (edge.sourceHandle ?? "").replace(/^out:/, "") }));
+    const center = selected.reduce((point, node) => ({ x: point.x + node.position.x / selected.length, y: point.y + node.position.y / selected.length }), { x: 0, y: 0 });
+    const definition: NodeDefinition = {
+      id: crypto.randomUUID(), name: "New Composite", description: "Reusable network of Visual Code nodes.", kind: "composite",
+      inputs, outputs, template: "", outputTemplates: outputs.map(() => ""), category: "Default", language: normalizeExtension(targetExtension),
+      definitionGraph: { nodes: selected.map((node) => ({ ...node, selected: false })), edges: internalEdges },
+      compositeInputMappings, compositeOutputMappings,
+    };
+    setCompositeCreationDraft({ definitionId: definition.id, nodeIds: [...selectedIds], incomingEdges, outgoingEdges, center });
+    setDefinitionTargetNodeId("");
+    setDefinitionDraft(definition);
+    setSettingsNodeId("");
+  }
 
   async function saveGraph() {
     if (
@@ -875,7 +890,7 @@ export default function App() {
         setTargetExtension(extension);
         setSourceFile(data.sourceFile);
         setNodes(data.nodes as Node<FunctionNodeData>[]);
-        setEdges(data.edges as Edge[]);
+        setEdges(retainValidSinglePortConnections(data.nodes as Node<FunctionNodeData>[], data.edges as Edge[]));
         setEditorKind("graph");
         setCurrentFile(entry.path);
         setIsDirty(false);
@@ -1311,11 +1326,11 @@ export default function App() {
 
   function beginFunctionDefinition(nodeId: string) {
     const node = nodes.find((item) => item.id === nodeId);
-    if (!node || node.data.kind !== "function" || (node.data.definitionId && node.data.definitionId !== "builtin-function")) return;
+    if (!node || node.data.kind !== "function") return;
     const data = node.data;
-    setDefinitionTargetNodeId(nodeId);
+    setDefinitionTargetNodeId(data.definitionId && data.definitionId !== "builtin-function" ? "" : nodeId);
     setDefinitionDraft({
-      id: "builtin-function",
+      id: data.definitionId ?? "builtin-function",
       name: data.label,
       description: data.description,
       kind: "function",
@@ -1323,7 +1338,8 @@ export default function App() {
       outputs: data.outputs.map((port) => ({ ...port })),
       template: data.template,
       outputTemplates: [...data.outputTemplates],
-      category: "Default",
+      valueParameters: data.valueParameters?.map((parameter) => ({ ...parameter })) ?? [],
+      category: data.category ?? "Default",
       language: normalizeExtension(targetExtension),
       definitionGraph: data.definitionGraph,
       editableParameters: data.editableParameters,
@@ -1333,28 +1349,65 @@ export default function App() {
 
   function handleFunctionDefinitionSaved(definition: NodeDefinition) {
     const targetId = definitionTargetNodeId;
-    setNodes((current) => current.map((node) => node.id === targetId
+    const compositeCreation = compositeCreationDraft;
+    if (definition.kind === "composite" && compositeCreation?.definitionId === definition.id) {
+      const selectedIds = new Set(compositeCreation.nodeIds);
+      const outerId = crypto.randomUUID();
+      const outer: Node<FunctionNodeData> = { id: outerId, type: "function", position: compositeCreation.center, data: createNodeData(definition) };
+      const incoming = compositeCreation.incomingEdges.flatMap((edge, index) => {
+        const input = definition.inputs[index];
+        return input ? [{ ...edge, target: outerId, targetHandle: `in:${input.id}` }] : [];
+      });
+      const outgoing = compositeCreation.outgoingEdges.flatMap((edge, index) => {
+        const output = definition.outputs[index];
+        return output ? [{ ...edge, source: outerId, sourceHandle: `out:${output.id}` }] : [];
+      });
+      const nextNodes = [...nodes.filter((node) => !selectedIds.has(node.id)), outer];
+      const nextEdges = [...edges.filter((edge) => !selectedIds.has(edge.source) && !selectedIds.has(edge.target)), ...incoming, ...outgoing];
+      setNodes(nextNodes);
+      setEdges(retainValidSinglePortConnections(nextNodes, nextEdges));
+      setCompositeCreationDraft(null);
+      setIsDirty(true);
+      setDefinitionDraft(null);
+      setNodeLibraryRefreshVersion((version) => version + 1);
+      setNotice(`Created Composite Node “${definition.name}”.`);
+      return;
+    }
+    const definitionEditability = { ...DEFAULT_NODE_PARAMETER_EDITABILITY, ...definition.editableParameters };
+    const nextNodes = nodes.map((node) => (targetId ? node.id === targetId : node.data.definitionId === definition.id)
       ? { ...node, data: {
           ...node.data,
-          label: definition.name,
-          description: definition.description,
-          kind: "function",
-          inputs: definition.inputs,
-          outputs: definition.outputs,
-          template: definition.template,
-          outputTemplates: definition.outputTemplates,
+          label: targetId || !definitionEditability.name ? definition.name : node.data.label,
+          description: !definitionEditability.description ? definition.description : node.data.description,
+          kind: definition.kind,
+          inputs: definitionEditability.inputCount ? [...definition.inputs, ...node.data.inputs.filter((port) => !definition.inputs.some((next) => next.id === port.id))] : definition.inputs,
+          outputs: definitionEditability.outputCount ? [...definition.outputs, ...node.data.outputs.filter((port) => !definition.outputs.some((next) => next.id === port.id))] : definition.outputs,
+          template: definitionEditability.logic ? node.data.template : definition.template,
+          outputTemplates: definitionEditability.outputMappings ? node.data.outputTemplates : definition.outputTemplates,
           definitionId: definition.id,
           category: definition.category ?? "Default",
           language: definition.language,
           definitionGraph: definition.definitionGraph,
           editableParameters: definition.editableParameters,
+          valueParameters: (definition.valueParameters ?? []).map((parameter) => ({
+            ...parameter,
+            value: node.data.valueParameters?.find((current) => current.inputId === parameter.inputId)?.value ?? parameter.value,
+          })),
+          compositeInputMappings: definition.compositeInputMappings ?? [],
+          compositeOutputMappings: definition.compositeOutputMappings ?? [],
+          compositeParameters: (definition.compositeParameters ?? []).map((parameter) => ({
+            ...parameter,
+            value: node.data.compositeParameters?.find((current) => current.id === parameter.id)?.value ?? parameter.value,
+          })),
         } }
-      : node));
+      : node);
+    setNodes(nextNodes);
+    setEdges((current) => retainValidSinglePortConnections(nextNodes, current));
     setIsDirty(true);
     setDefinitionDraft(null);
     setDefinitionTargetNodeId("");
     setNodeLibraryRefreshVersion((version) => version + 1);
-    setNotice(`Saved reusable Function Node “${definition.name}”.`);
+    setNotice(`Saved reusable ${definition.kind === "composite" ? "Composite" : "Function"} Node “${definition.name}”.`);
   }
 
   const visibleEntries = useMemo(
@@ -1598,7 +1651,10 @@ export default function App() {
               key={nodeLibraryPath(nodeLibraryFolder, targetExtension)}
               libraryFolder={nodeLibraryPath(nodeLibraryFolder, targetExtension)}
               targetExtension={targetExtension}
-              onAddNode={addDefinitionToGraph}
+              onAddNode={definitionDraft
+                ? (definition) => { if (definitionAddNodeHandler.current) definitionAddNodeHandler.current(definition); }
+                : addDefinitionToGraph}
+              onEditDefinition={(definition) => { setDefinitionTargetNodeId(""); setDefinitionDraft(definition); setSettingsNodeId(""); }}
               expanded={nodeLibraryExpanded}
               onExpandedChange={setNodeLibraryExpanded}
               refreshVersion={nodeLibraryRefreshVersion}
@@ -1649,13 +1705,24 @@ export default function App() {
           {editorKind === "graph" ? (
             definitionDraft ? (
               <div className="definition-editor-host">
-                <FunctionDefinitionEditor
+                {definitionDraft.kind === "composite" ? <CompositeDefinitionEditor
                   initialDefinition={definitionDraft}
                   targetExtension={normalizeExtension(targetExtension)}
                   libraryFolder={nodeLibraryPath(nodeLibraryFolder, targetExtension)}
-                  onCancel={() => { setDefinitionDraft(null); setDefinitionTargetNodeId(""); }}
+                  isNew={compositeCreationDraft?.definitionId === definitionDraft.id}
+                  minimumInputs={compositeCreationDraft?.definitionId === definitionDraft.id ? compositeCreationDraft.incomingEdges.length : 0}
+                  minimumOutputs={compositeCreationDraft?.definitionId === definitionDraft.id ? compositeCreationDraft.outgoingEdges.length : 0}
+                  onCancel={() => { setDefinitionDraft(null); setDefinitionTargetNodeId(""); setCompositeCreationDraft(null); }}
                   onSaved={handleFunctionDefinitionSaved}
-                />
+                  onAddNodeHandler={registerDefinitionAddNodeHandler}
+                /> : <FunctionDefinitionEditor
+                  initialDefinition={definitionDraft}
+                  targetExtension={normalizeExtension(targetExtension)}
+                  libraryFolder={nodeLibraryPath(nodeLibraryFolder, targetExtension)}
+                  onCancel={() => { setDefinitionDraft(null); setDefinitionTargetNodeId(""); setCompositeCreationDraft(null); }}
+                  onSaved={handleFunctionDefinitionSaved}
+                  onAddNodeHandler={registerDefinitionAddNodeHandler}
+                />}
               </div>
             ) : (
             <>
@@ -1677,6 +1744,9 @@ export default function App() {
                     {normalizeExtension(targetExtension)}
                   </strong>
                 </div>
+                {nodes.filter((node) => node.selected).length > 1 && <button className="create-composite-button" onClick={() => void createCompositeFromSelection()}>
+                  Create Composite ({nodes.filter((node) => node.selected).length})
+                </button>}
               </div>
 
               <div className="graph-area">
@@ -1692,7 +1762,11 @@ export default function App() {
                   onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }}
                   onNodeDoubleClick={(_event, node) => setSettingsNodeId(node.id)}
                   onNodeContextMenu={(event, node) => { event.preventDefault(); setSettingsNodeId(node.id); }}
+                  onPaneContextMenu={(event) => { event.preventDefault(); if (nodes.filter((node) => node.selected).length > 1) void createCompositeFromSelection(); }}
                   isValidConnection={isValidConnection}
+                  selectionOnDrag
+                  selectionMode={SelectionMode.Partial}
+                  multiSelectionKeyCode="Shift"
                   fitView
                   colorMode="dark"
                   deleteKeyCode={["Backspace", "Delete"]}
@@ -1726,7 +1800,13 @@ export default function App() {
                   const minimumInputs = lockedDefinition ? Math.max(0, editability.minInputCount ?? data.inputs.length) : 0;
                   const minimumOutputs = lockedDefinition ? Math.max(0, editability.minOutputCount ?? data.outputs.length) : 0;
                   const update = (patch: Partial<FunctionNodeData>) => {
-                    setNodes((current) => current.map((node) => node.id === selectedId
+                    const independent = new Set(["label", "value", "inputs", "outputs", "template", "outputTemplates", "valueParameters", "compositeParameters"]);
+                    const patchKeys = Object.keys(patch);
+                    const shareAcrossSelection = patchKeys.every((key) => !independent.has(key));
+                    const selectedIds = shareAcrossSelection
+                      ? new Set(nodes.filter((node) => node.selected || node.id === selectedId).map((node) => node.id))
+                      : new Set([selectedId]);
+                    setNodes((current) => current.map((node) => selectedIds.has(node.id)
                       ? { ...node, data: { ...node.data, ...patch } }
                       : node));
                     setIsDirty(true);
@@ -1761,12 +1841,33 @@ export default function App() {
                   return <div key={selectedNode.id} className="node-instance-settings">
                     <header>
                       <strong>Node settings</strong>
-                      {canDefine && <button className="define-node-button" onClick={() => beginFunctionDefinition(selectedId)}>Define</button>}
+                      {canDefine && <button className="define-node-button" onClick={() => beginFunctionDefinition(selectedId)}>{lockedDefinition ? "Edit definition" : "Define"}</button>}
                       <button onClick={() => setSettingsNodeId("")}>×</button>
                     </header>
                     {(!lockedDefinition || editability.name) && <label>Name<input value={data.label} onChange={(event) => update({ label: event.target.value })} /></label>}
                     {lockedDefinition && editability.description && <label>Description<input value={data.description} onChange={(event) => update({ description: event.target.value })} /></label>}
                     {data.kind === "value" && <label>Value<input value={nodeValueOverrides[selectedId] ?? data.value ?? ""} onChange={(event) => updateNodeValue(selectedId, event.target.value)} /></label>}
+                    {data.kind === "function" && (data.valueParameters ?? []).filter((parameter) =>
+                      parameter.editable && !edges.some((edge) => edge.target === selectedId && edge.targetHandle === `in:${parameter.inputId}`),
+                    ).map((parameter) => <label key={parameter.inputId}>{parameter.name}
+                      <input value={parameter.value} onChange={(event) => {
+                        const value = event.target.value;
+                        setNodes((current) => current.map((node) => node.id === selectedId
+                          ? { ...node, data: { ...node.data, valueParameters: (node.data.valueParameters ?? []).map((item) => item.inputId === parameter.inputId ? { ...item, value } : item) } }
+                          : node));
+                        setIsDirty(true);
+                      }} />
+                    </label>)}
+                    {data.kind === "composite" && (data.compositeParameters ?? []).filter((parameter) => parameter.editable && !edges.some((edge) => {
+                      const outerInput = edge.target === selectedId ? edge.targetHandle?.replace(/^in:/, "") : "";
+                      return data.compositeInputMappings?.some((mapping) => mapping.inputId === outerInput && mapping.nodeId === parameter.targetNodeId && mapping.nodeInputId === parameter.inputId) ?? false;
+                    })).map((parameter) => <label key={parameter.id}>{parameter.name}<input value={parameter.value} onChange={(event) => {
+                      const value = event.target.value;
+                      setNodes((current) => current.map((node) => node.id === selectedId
+                        ? { ...node, data: { ...node.data, compositeParameters: (node.data.compositeParameters ?? []).map((item) => item.id === parameter.id ? { ...item, value } : item) } }
+                        : node));
+                      setIsDirty(true);
+                    }} /></label>)}
                     <label>Color<input type="color" value={data.color ?? "#24344c"} onChange={(event) => update({ color: event.target.value })} /></label>
                     {canEditInputs && <label>Inputs<input type="number" min={minimumInputs} max="16" value={data.inputs.length} onChange={(event) => resizePorts("inputs", Number(event.target.value))} /></label>}
                     {canEditOutputs && <label>Outputs<input type="number" min={minimumOutputs} max="16" value={data.outputs.length} onChange={(event) => resizePorts("outputs", Number(event.target.value))} /></label>}

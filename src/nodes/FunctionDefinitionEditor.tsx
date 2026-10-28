@@ -36,6 +36,7 @@ type Props = {
   libraryFolder: string;
   onCancel: () => void;
   onSaved: (definition: NodeDefinition) => void;
+  onAddNodeHandler: (handler: ((definition: NodeDefinition) => void) | null) => void;
 };
 
 function makePorts(count: number, direction: "input" | "output", current: NodePort[]): NodePort[] {
@@ -47,7 +48,27 @@ function makePorts(count: number, direction: "input" | "output", current: NodePo
   });
 }
 
-export default function FunctionDefinitionEditor({ initialDefinition, targetExtension, libraryFolder, onCancel, onSaved }: Props) {
+function validDefinitionEdges(definition: NodeDefinition): Edge[] {
+  const nodes = definition.definitionGraph?.nodes ?? [];
+  const inputs = new Set(definition.inputs.map((input) => input.id));
+  const occupiedInputs = new Set<string>();
+  const occupiedOutputs = new Set<string>();
+  return (definition.definitionGraph?.edges ?? []).filter((edge) => {
+    if (edge.target !== ROOT_ID || !edge.sourceHandle?.startsWith("out:") || !edge.targetHandle?.startsWith("in:")) return false;
+    const source = nodes.find((node) => node.id === edge.source);
+    const outputId = edge.sourceHandle.slice(4);
+    const inputId = edge.targetHandle.slice(3);
+    if (!source || source.data.kind !== "value" || !source.data.outputs.some((port) => port.id === outputId) || !inputs.has(inputId)) return false;
+    const outputKey = `${edge.source}:${edge.sourceHandle}`;
+    const inputKey = `${edge.target}:${edge.targetHandle}`;
+    if (occupiedOutputs.has(outputKey) || occupiedInputs.has(inputKey)) return false;
+    occupiedOutputs.add(outputKey);
+    occupiedInputs.add(inputKey);
+    return true;
+  });
+}
+
+export default function FunctionDefinitionEditor({ initialDefinition, targetExtension, libraryFolder, onCancel, onSaved, onAddNodeHandler }: Props) {
   const [name, setName] = useState(initialDefinition.name);
   const [description, setDescription] = useState(initialDefinition.description);
   const [template, setTemplate] = useState(initialDefinition.template);
@@ -59,6 +80,9 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
     ),
   );
   const [outputMappingMode, setOutputMappingMode] = useState(false);
+  const [parameterEditable, setParameterEditable] = useState<Record<string, boolean>>(() => Object.fromEntries(
+    (initialDefinition.valueParameters ?? []).map((parameter) => [parameter.inputId, parameter.editable]),
+  ));
   const [editableParameters, setEditableParameters] = useState<NodeParameterEditability>(() => ({
     ...DEFAULT_NODE_PARAMETER_EDITABILITY,
     ...initialDefinition.editableParameters,
@@ -85,11 +109,12 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
       .filter((node) => node.data.kind === "value")
       .map((node) => [node.id, node.data.value ?? ""]),
   ));
-  const [edges, setEdges] = useState<Edge[]>(() => (initialDefinition.definitionGraph?.edges ?? []).map((edge) => ({ ...edge })));
+  const [edges, setEdges] = useState<Edge[]>(() => validDefinitionEdges(initialDefinition).map((edge) => ({ ...edge })));
   const [settingsNodeId, setSettingsNodeId] = useState("");
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState("");
   const flowInstance = useRef<ReactFlowInstance<Node<FunctionNodeData>, Edge> | null>(null);
+  const canvasRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let active = true;
@@ -128,6 +153,19 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
     return template.replace(/\binput(\d+)\b/g, (_match, index: string) => values.get(`input${index}`) ?? "");
   }, [edges, inputs, nodeValues, template, valueNodes]);
 
+  const valueParameters = useMemo(() => inputs.flatMap((input, index) => {
+    const edge = edges.find((item) => item.target === ROOT_ID && item.targetHandle === `in:${input.id}`);
+    const source = valueNodes.find((node) => node.id === edge?.source);
+    if (!source || source.data.kind !== "value") return [];
+    const existing = initialDefinition.valueParameters?.find((parameter) => parameter.inputId === input.id);
+    return [{
+      inputId: input.id,
+      name: `value${index + 1}`,
+      value: nodeValues[source.id] ?? source.data.value ?? "",
+      editable: parameterEditable[input.id] ?? existing?.editable ?? true,
+    }];
+  }), [edges, initialDefinition.valueParameters, inputs, nodeValues, parameterEditable, valueNodes]);
+
   const handleNodesChange = useCallback((changes: NodeChange<Node<FunctionNodeData>>[]) => {
     setValueNodes((current) => applyNodeChanges(changes.filter((change) => change.type === "add" || change.id !== ROOT_ID), current));
   }, []);
@@ -136,6 +174,30 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
     setEdges((current) => applyEdgeChanges(changes, current));
   }, []);
 
+  const addValueNode = useCallback((definition: NodeDefinition, base = { x: 430, y: 285 }) => {
+    if (definition.kind !== "value") return;
+    let position = { ...base };
+    let attempt = 0;
+    const occupied = [rootNode, ...valueNodes];
+    while (occupied.some((node) => Math.abs(node.position.x - position.x) < 190 && Math.abs(node.position.y - position.y) < 72)) {
+      attempt += 1;
+      position = { x: base.x + attempt * 28, y: base.y + attempt * 22 };
+    }
+    const node: Node<FunctionNodeData> = { id: crypto.randomUUID(), type: "function", position, data: createNodeData(definition) };
+    setValueNodes((current) => [...current, node]);
+    setNodeValues((current) => ({ ...current, [node.id]: "" }));
+  }, [rootNode, valueNodes]);
+
+  useEffect(() => {
+    onAddNodeHandler((definition) => {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      const center = rect ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 } : { x: 430, y: 285 };
+      const position = flowInstance.current?.screenToFlowPosition(center) ?? { x: 430, y: 285 };
+      addValueNode(definition, position);
+    });
+    return () => onAddNodeHandler(null);
+  }, [addValueNode, onAddNodeHandler]);
+
   const handleDrop = useCallback((event: React.DragEvent) => {
     event.preventDefault();
     event.stopPropagation();
@@ -143,39 +205,30 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
     if (!raw) return;
     try {
       const definition = JSON.parse(raw) as NodeDefinition;
-      if (definition.kind !== "value") return;
       const base = flowInstance.current?.screenToFlowPosition({ x: event.clientX, y: event.clientY }) ?? { x: 430, y: 170 };
-      let position = { ...base };
-      let attempt = 0;
-      const occupied = [rootNode, ...valueNodes];
-      while (occupied.some((node) => Math.abs(node.position.x - position.x) < 190 && Math.abs(node.position.y - position.y) < 72)) {
-        attempt += 1;
-        position = { x: base.x + attempt * 28, y: base.y + attempt * 22 };
-      }
-      const node: Node<FunctionNodeData> = {
-        id: crypto.randomUUID(),
-        type: "function",
-        position,
-        data: createNodeData(definition),
-      };
-      setValueNodes((current) => [...current, node]);
-      setNodeValues((current) => ({ ...current, [node.id]: "" }));
-    } catch (error) {
-      console.error("Could not add a Value Node to the definition:", error);
-    }
-  }, [rootNode, valueNodes]);
+      addValueNode(definition, base);
+    } catch (error) { console.error("Could not add a Value Node to the definition:", error); }
+  }, [addValueNode]);
 
   const handleConnect = useCallback((connection: Connection) => {
     if (connection.target !== ROOT_ID || !connection.targetHandle?.startsWith("in:")) return;
     const source = valueNodes.find((node) => node.id === connection.source);
-    if (!source || source.data.kind !== "value" || !connection.sourceHandle) return;
-    setEdges((current) => addEdge({
-      ...connection,
-      id: crypto.randomUUID(),
-      type: "smoothstep",
-      style: { stroke: "#60a5fa", strokeWidth: 2 },
-    }, current));
-  }, [valueNodes]);
+    if (!source || source.data.kind !== "value" || !connection.sourceHandle ||
+      !source.data.outputs.some((port) => `out:${port.id}` === connection.sourceHandle) ||
+      !inputs.some((port) => `in:${port.id}` === connection.targetHandle)) return;
+    setEdges((current) => {
+      if (current.some((edge) =>
+        (edge.source === connection.source && edge.sourceHandle === connection.sourceHandle) ||
+        (edge.target === connection.target && edge.targetHandle === connection.targetHandle)
+      )) return current;
+      return addEdge({
+        ...connection,
+        id: crypto.randomUUID(),
+        type: "smoothstep",
+        style: { stroke: "#60a5fa", strokeWidth: 2 },
+      }, current);
+    });
+  }, [inputs, valueNodes]);
 
   function setInputCount(count: number) {
     const next = makePorts(count, "input", inputs);
@@ -212,6 +265,7 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
       outputs,
       template,
       outputTemplates: mappings,
+      valueParameters,
       editableParameters: {
         ...editableParameters,
         minInputCount: inputs.length,
@@ -255,7 +309,7 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
         <div><strong>Define Function Node</strong><span>Build a reusable node for {targetExtension}</span></div>
         <button className="cancel-button" onClick={onCancel}>Back to graph</button>
       </div>
-      <div className="definition-canvas">
+      <div ref={canvasRef} className="definition-canvas" onDrop={handleDrop} onDragOver={(event) => { event.preventDefault(); event.stopPropagation(); event.dataTransfer.dropEffect = "copy"; }}>
         <ReactFlow<Node<FunctionNodeData>, Edge>
           nodes={[rootNode, ...valueNodes]}
           edges={edges}
@@ -263,8 +317,6 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
           onNodesChange={handleNodesChange}
           onEdgesChange={handleEdgesChange}
           onConnect={handleConnect}
-          onDrop={handleDrop}
-          onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = "copy"; }}
           onInit={(instance) => { flowInstance.current = instance; }}
           onNodeDoubleClick={(_event, node) => { if (node.id !== ROOT_ID) setSettingsNodeId(node.id); }}
           onNodeContextMenu={(event, node) => { event.preventDefault(); if (node.id !== ROOT_ID) setSettingsNodeId(node.id); }}
@@ -329,7 +381,15 @@ export default function FunctionDefinitionEditor({ initialDefinition, targetExte
           <label>Category<select value={category} onChange={(event) => setCategory(event.target.value)}>{categories.map((item) => <option value={item} key={item}>{item}</option>)}</select></label>
           <button className="save-button" disabled={saving || !libraryFolder.trim()} onClick={() => void saveDefinition()}>{saving ? "Saving…" : "Save definition"}</button>
         </div>
-        <div className="definition-preview"><span>Preview from connected Value Nodes</span><code>{preview || "Generated text will appear here."}</code>{message && <small>{message}</small>}</div>
+      {valueParameters.length > 0 && <div className="definition-value-parameters">
+        <strong>Value parameters</strong>
+        {valueParameters.map((parameter) => <label key={parameter.inputId}>
+          <span>{parameter.name} · {parameter.inputId}</span>
+          <input value={parameter.value} readOnly aria-label={`${parameter.name} default value`} />
+          <span><input type="checkbox" checked={parameter.editable} onChange={(event) => setParameterEditable((current) => ({ ...current, [parameter.inputId]: event.target.checked }))} /> Editable on instances</span>
+        </label>)}
+      </div>}
+      <div className="definition-preview"><span>Preview from connected Value Nodes</span><code>{preview || "Generated text will appear here."}</code>{message && <small>{message}</small>}</div>
       </div>
     </div>
   );

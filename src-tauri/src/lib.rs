@@ -661,6 +661,8 @@ pub fn run() {
             nodes::save_node_definition,
             nodes::create_node_category,
             nodes::move_node_definition,
+            nodes::move_node_category,
+            nodes::reorder_node_category,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

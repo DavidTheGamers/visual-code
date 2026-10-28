@@ -143,6 +143,12 @@ export default function NodeCanvas({
         (node) => node.id === connection.target
       );
 
+      const connectionId = "id" in connection ? connection.id : undefined;
+      if (edges.some((edge) => edge.id !== connectionId && (
+        (edge.source === connection.source && edge.sourceHandle === connection.sourceHandle) ||
+        (edge.target === connection.target && edge.targetHandle === connection.targetHandle)
+      ))) return false;
+
       if (!sourceNode || !targetNode) {
         return false;
       }
@@ -186,7 +192,7 @@ export default function NodeCanvas({
         targetPort.type
       );
     },
-    [nodes, getPort]
+    [edges, nodes, getPort]
   );
 
   const handleConnect = useCallback(
@@ -223,7 +229,13 @@ export default function NodeCanvas({
         },
       };
 
-      setEdges((currentEdges) => addEdge(newEdge, currentEdges));
+      setEdges((currentEdges) => {
+        if (currentEdges.some((edge) =>
+          (edge.source === connection.source && edge.sourceHandle === connection.sourceHandle) ||
+          (edge.target === connection.target && edge.targetHandle === connection.targetHandle)
+        )) return currentEdges;
+        return addEdge(newEdge, currentEdges);
+      });
       onChanged();
     },
     [nodes, getPort, isValidConnection, setEdges, onChanged]

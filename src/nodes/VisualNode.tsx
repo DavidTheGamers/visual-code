@@ -31,12 +31,19 @@ export function VisualNode({ id, data, selected }: NodeProps<Node<FunctionNodeDa
         isVisible={selected}
         minWidth={190}
         minHeight={minimumHeight}
-        onResizeEnd={(_event, size) => flow.updateNodeData(id, { width: size.width, height: size.height })}
+        onResizeEnd={(_event, size) => {
+          const selectedNodes = flow.getNodes().filter((node) => node.selected);
+          const targets = selectedNodes.length > 1 ? selectedNodes : flow.getNodes().filter((node) => node.id === id);
+          for (const node of targets) {
+            const minimum = Math.max(72, (Math.max(node.data.inputs.length, node.data.outputs.length) + 1) * 18);
+            flow.updateNodeData(node.id, { width: Math.max(190, size.width), height: Math.max(minimum, size.height) });
+          }
+        }}
       />
       {renderPorts(data.inputs, "input")}
       {renderPorts(data.outputs, "output")}
       <div className="vc-node-header">
-        <span className="vc-node-symbol">{data.kind === "value" ? "◇" : "ƒ"}</span>
+        <span className="vc-node-symbol">{data.kind === "value" ? "◇" : data.kind === "composite" ? "▧" : "ƒ"}</span>
         <strong>{data.label}</strong>
       </div>
     </div>
